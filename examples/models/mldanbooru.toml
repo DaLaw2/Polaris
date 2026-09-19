@@ -1,0 +1,30 @@
+name = "mldanbooru"
+
+[source]
+repo = "deepghs/ml-danbooru-onnx"
+revision = "eb9058324a741f1b90d4db168f6e1d6b6cb7e63d"
+model = "ml_caformer_m36_dec-5-97527.onnx"
+
+[[preprocess]]
+op = "resize"
+size = 448
+interpolation = "bilinear"
+
+[[preprocess]]
+op = "to_tensor"
+
+[outputs]
+scores = "#0"
+activation = "sigmoid"
+
+[vocabulary]
+repo = "deepghs/imgutils-models"
+revision = "35e0ed8f35ce0dbea674568161a48b31ba7d2a99"
+file = "mldanbooru/mldanbooru_tags.csv"
+format = "csv"
+name = "real_name"
+categories = { "*" = "general" }
+
+[defaults]
+roles = { general = 5 }
+enabled_by_default = true

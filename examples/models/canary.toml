@@ -1,0 +1,46 @@
+name = "canary"
+note = "Character only."
+
+[source]
+repo = "yasamari/wd-eva02-tagger-2026-canary-onnx-with-embeddings"
+revision = "dfb8803a5931276375c2247621e590484a111d22"
+model = "model.onnx"
+
+[[preprocess]]
+op = "pad_square"
+fill = [255, 255, 255]
+
+[[preprocess]]
+op = "resize"
+size = "model"
+interpolation = "bicubic"
+
+[[preprocess]]
+op = "to_tensor"
+
+[[preprocess]]
+op = "channel_order"
+order = "bgr"
+
+[[preprocess]]
+op = "normalize"
+mean = [0.5, 0.5, 0.5]
+std = [0.5, 0.5, 0.5]
+
+[outputs]
+scores = "output"
+
+[vocabulary]
+file = "selected_tags.csv"
+format = "csv"
+name = "name"
+category = "category"
+categories = { "4" = "character" }
+
+[thresholds]
+kind = "constant"
+value = { character = 0.6094 }
+
+[defaults]
+roles = { character = 10 }
+enabled_by_default = true

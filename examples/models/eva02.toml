@@ -1,0 +1,37 @@
+name = "eva02"
+note = "WD v3. Exports no embedding, so with this as the primary `works.embedding` is never filled and similarity search over it silently returns nothing."
+
+[source]
+repo = "SmilingWolf/wd-eva02-large-tagger-v3"
+revision = "b25b82a03f7282e41aa2f257a52c7583b710bd1c"
+model = "model.onnx"
+
+[[preprocess]]
+op = "pad_square"
+fill = [255, 255, 255]
+
+[[preprocess]]
+op = "resize"
+size = "model"
+interpolation = "bicubic"
+
+[[preprocess]]
+op = "to_array"
+
+[[preprocess]]
+op = "channel_order"
+order = "bgr"
+
+[outputs]
+scores = "#0"
+
+[vocabulary]
+file = "selected_tags.csv"
+format = "csv"
+name = 1
+category = 2
+categories = { "0" = "general", "4" = "character", "9" = "rating" }
+
+[defaults]
+roles = { general = 10, character = 10, rating = 10, embedding = 10 }
+fills_primary_roles = true

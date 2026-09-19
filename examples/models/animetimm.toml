@@ -1,0 +1,45 @@
+name = "animetimm"
+note = "WD v3 is the terminal release of a discontinued line; SmilingWolf handed off to animetimm in 2024. Its ONNX exports a 1024-d embedding, which WD v3's does not export at all."
+
+[source]
+repo = "animetimm/eva02_large_patch14_448.dbv4-full"
+revision = "7f11ec9fdb54dfbfd7cd7fad2ecc452a25b57acb"
+model = "model.onnx"
+
+[[preprocess]]
+op = "pad_square"
+fill = [255, 255, 255]
+
+[[preprocess]]
+op = "resize"
+size = 448
+interpolation = "bicubic"
+
+[[preprocess]]
+op = "to_tensor"
+
+[[preprocess]]
+op = "normalize"
+mean = [0.48145467, 0.45782751, 0.40821072]
+std = [0.26862955, 0.26130259, 0.27577710]
+
+[outputs]
+scores = "prediction"
+embedding = "embedding"
+
+[vocabulary]
+file = "selected_tags.csv"
+format = "csv"
+name = "name"
+category = "category"
+categories = { "0" = "general", "4" = "character", "9" = "rating" }
+
+[thresholds]
+kind = "csv"
+threshold = "best_threshold"
+f1 = "best_f1"
+
+[defaults]
+roles = { general = 10, character = 10, rating = 10, embedding = 10 }
+enabled_by_default = true
+fills_primary_roles = true

@@ -1,0 +1,43 @@
+name = "cl_tagger"
+note = "Character and copyright."
+
+[source]
+repo = "cella110n/cl_tagger_v2"
+revision = "b57909b8e9c63f71e208a26473e7aabdf45ed6b6"
+subfolder = "v2_01a"
+model = "model.onnx"
+extra = ["model.onnx.data"]
+
+[[preprocess]]
+op = "resize"
+size = "model"
+interpolation = "bicubic"
+
+[[preprocess]]
+op = "to_tensor"
+
+[[preprocess]]
+op = "normalize"
+mean = [0.5, 0.5, 0.5]
+std = [0.5, 0.5, 0.5]
+
+[outputs]
+scores = "#0"
+activation = "sigmoid"
+
+[vocabulary]
+file = "model_vocabulary.json"
+format = "json_idx"
+space_to_underscore = true
+categories = { Character = "character", Copyright = "copyright" }
+
+[thresholds]
+kind = "npz"
+file = "model_tag_metrics.npz"
+threshold = "best_thr"
+f1 = "best_f1"
+names = "tag_names"
+
+[defaults]
+roles = { character = 10, copyright = 10 }
+enabled_by_default = true

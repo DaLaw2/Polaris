@@ -1,0 +1,36 @@
+name = "camie"
+note = "Artist only. It also emits copyright/character/general, and letting those in would put it in silent contention with the primary and with the copyright derived from character tags. max_images=2 because artist is a work-level property and the sampler puts the cover first; it is slower than the other models and runs sequentially, so scoring every sampled page would multiply scan time."
+
+[source]
+repo = "deepghs/camie_tagger_onnx"
+revision = "49c5ecc6554641f6db16a369688cb176bb595a57"
+subfolder = "refined"
+model = "model.onnx"
+
+[[preprocess]]
+op = "pad_square"
+fill = [0, 0, 0]
+
+[[preprocess]]
+op = "resize"
+size = 512
+interpolation = "lanczos"
+
+[[preprocess]]
+op = "to_tensor"
+
+[outputs]
+scores = "output"
+embedding = "embedding"
+
+[vocabulary]
+file = "selected_tags.csv"
+format = "csv"
+name = 2
+category = 3
+categories = { "0" = "general", "1" = "artist", "3" = "copyright", "4" = "character", "9" = "rating" }
+
+[defaults]
+roles = { artist = 10 }
+concurrent = false
+max_images = 2

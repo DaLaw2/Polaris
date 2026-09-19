@@ -1,0 +1,38 @@
+name = "pixai"
+note = "PixAI Tagger v0.9, deepghs' ONNX export. 13,461 tags: 9,741 general and 3,720 character. The card's cutoffs are 0.3 general and 0.85 character."
+
+[source]
+repo = "deepghs/pixai-tagger-v0.9-onnx"
+revision = "d8cf666911a2c3d10d586d7823259192313c7eb7"
+model = "model.onnx"
+
+[[preprocess]]
+op = "resize"
+size = 448
+interpolation = "bilinear"
+
+[[preprocess]]
+op = "to_tensor"
+
+[[preprocess]]
+op = "normalize"
+mean = [0.5, 0.5, 0.5]
+std = [0.5, 0.5, 0.5]
+
+[outputs]
+scores = "prediction"
+embedding = "embedding"
+
+[vocabulary]
+file = "selected_tags.csv"
+format = "csv"
+name = "name"
+category = "category"
+categories = { "0" = "general", "4" = "character" }
+
+[thresholds]
+kind = "constant"
+value = { general = 0.3, character = 0.85 }
+
+[defaults]
+roles = { general = 5, character = 5 }

@@ -1,0 +1,45 @@
+[project]
+name = "polaris"
+version = "0.1.0"
+description = "Multi-dimensional media classification and search"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "DaLaw2", email = "dalaw22222@gmail.com" }
+]
+requires-python = ">=3.14"
+
+dependencies = [
+    "asyncpg>=0.30.0",
+    "av>=15.0.0",
+    "fastapi>=0.141.1",
+    "huggingface-hub>=0.36.0",
+    "numpy>=2.5.2",
+    "nvidia-cublas-cu12>=12.9.0",
+    "nvidia-cudnn-cu12>=9.25.0",
+    "onnx>=1.19.0",
+    "onnxruntime-gpu>=1.29.0",
+    "pgvector>=0.3.0",
+    "pillow>=12.3.0",
+    "python-dotenv>=1.2.1",
+    "uvicorn[standard]>=0.52.4",
+]
+
+[project.optional-dependencies]
+translate = ["deep-translator>=1.11.4"]
+
+[project.scripts]
+polaris-worker = "polaris.cli.scan_worker:run"
+polaris-migrate = "polaris.cli.migrate:run"
+polaris-curated = "polaris.cli.curated:run"
+
+[project.urls]
+Repository = "https://github.com/DaLaw2/Polaris"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
