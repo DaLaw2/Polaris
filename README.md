@@ -153,7 +153,7 @@ scores only the works the version has no scores for.
 ## Requirements
 
 - Windows, an NVIDIA GPU with CUDA
-- Docker (PostgreSQL 17 with pgvector)
+- WSL 3.0.1 or later with WSL containers (`wslc`), for PostgreSQL 17 with pgvector
 - Python 3.14 with [uv](https://docs.astral.sh/uv/)
 - Node.js
 - Optional: TensorRT 10
@@ -165,22 +165,26 @@ Copy `.env.example` to `.env` and set:
 | Variable | Meaning |
 |---|---|
 | `POLARIS_DSN` | PostgreSQL connection string. Required. |
-| `POSTGRES_PASSWORD` | Password for the Docker database, used when its volume is first created |
+| `POSTGRES_PASSWORD` | Password for the database container, used when its volume is first created |
 | `POLARIS_TENSORRT_DIR` | Optional. The TensorRT release directory containing `nvinfer_10.dll`. When set, FP16 models run on TensorRT; otherwise on CUDA. |
 | `POLARIS_MODELS_DIR` | Optional. Where model files are stored; default `models/` |
 | `POLARIS_ONNX_PROVIDER` | Optional. Forces an ONNX Runtime provider |
 
 Then run `start.cmd`. It installs the Python and web dependencies, starts
-Docker and the database, checks the schema, starts the API on port 8000 and
+the database container (creating it with `wslc` on the first run), checks the schema, starts the API on port 8000 and
 the web page on port 5173, and opens the browser. Logs go to `data\api.log`
 and `data\web.log` (`data\` is created locally and not part of the
-repository). `stop.cmd` stops the API and the web page.
+repository). `stop.cmd` stops the API and the web page; `wslc stop polaris-pg`
+stops the database.
+
+WSL keeps the container's disk under `%LOCALAPPDATA%\wslc` unless
+`session.storagePath` is set in `%LOCALAPPDATA%\wslc\settings.yaml`.
 
 Without the script:
 
 ```bash
 uv sync
-docker compose up -d
+wslc start polaris-pg     # start.cmd creates the container on the first run
 uv run python -m uvicorn polaris.app:app --port 8000
 cd web && npm install && npm run dev
 ```
@@ -228,10 +232,10 @@ tests/             test scripts
 Each file in `tests/` is a script run on its own against a scratch database:
 
 ```bash
-createdb polaris_test
+wslc exec polaris-pg createdb -U postgres polaris_test
 POLARIS_TEST_DSN=postgresql://user:pass@localhost:5432/polaris_test \
     uv run python tests/test_derive.py
-dropdb polaris_test
+wslc exec polaris-pg dropdb -U postgres polaris_test
 ```
 
 They use small generated images and ONNX graphs and do not download models
