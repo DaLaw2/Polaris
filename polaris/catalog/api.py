@@ -316,9 +316,11 @@ def _size(path: Path) -> int | None:
 
 
 class DiscardRequest(BaseModel):
-    """One place of a work, to send to the Recycle Bin."""
+    """One place of a work, to send to the Recycle Bin. `kept` names a
+    work that looks like it and stays, when this is its last place."""
 
     path: str
+    kept: str | None = None
 
 
 @router.post("/api/copies/discard")
@@ -352,6 +354,22 @@ async def discard_copy(req: DiscardRequest):
                     and not os.path.samefile(p, target)]
 
         kept = await asyncio.to_thread(others)
+        if not kept and req.kept:
+            other = await conn.fetchval(
+                "SELECT work_id FROM work_paths WHERE path = $1 AND present "
+                "UNION ALL SELECT work_id FROM work_copies WHERE path = $1 "
+                "LIMIT 1", req.kept)
+            if (other is not None and other != work_id
+                    and await asyncio.to_thread(
+                        lambda: Path(req.kept).exists()
+                        and not os.path.samefile(req.kept, target))):
+                try:
+                    await asyncio.to_thread(trash.recycle, target,
+                                            _size(target) or 0)
+                except trash.Refused as e:
+                    raise refuse(409, "recycle_refused", str(e))
+                await identity.mark_absent(conn, [req.path])
+                return {"discarded": req.path, "kept": [req.kept]}
         if not kept:
             raise refuse(409, "last_copy",
                          "this is the last copy of the work on disk")

@@ -80,6 +80,14 @@ async function allUnregistered() {
   busy.value = false
 }
 
+const open_ = computed(() => [...dirs.value, ...files.value].filter(e => !blocked(e)).map(e => e.path))
+const allOn = computed(() => open_.value.length > 0 && open_.value.every(p => chosen.value.includes(p)))
+function selectAll() {
+  chosen.value = allOn.value
+    ? chosen.value.filter(p => !open_.value.includes(p))
+    : [...chosen.value, ...open_.value.filter(p => !chosen.value.includes(p))]
+}
+
 const leaf = p => p.split(/[\\/]/).filter(Boolean).pop() || p
 const onKey = e => { if (e.key === 'Escape') emit('close') }
 onMounted(() => { window.addEventListener('keydown', onKey); open(props.start) })
@@ -101,6 +109,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         </nav>
         <button v-if="mode === 'register' && here" class="btn soft sm" :disabled="busy"
                 @click="allUnregistered">選取所有未登記</button>
+        <button v-if="mode === 'check' && open_.length" class="btn soft sm" :disabled="busy"
+                @click="selectAll">{{ allOn ? '取消全選' : '全選' }}</button>
       </div>
 
       <div class="pk-list">

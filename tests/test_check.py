@@ -157,11 +157,34 @@ async def test_discard_needs_a_live_library_copy(conn, tmp, held_id) -> None:
           "else only the checked copy goes")
 
 
+async def test_replace_keeps_the_work(conn, tmp, held_id) -> None:
+    """A near item takes the library copy's place under its own name."""
+    ids = {Path(r["path"]).name: r["id"] for r in await conn.fetch(
+        "SELECT id, path FROM check_items")}
+    held = str(tmp / "lib" / "held")
+    replace = observation_api.replace_with_check_item
+    await refused(replace(ids["fresh"], observation_api.ReplaceRequest(path=held)),
+                  404, "no_match")
+    await refused(replace(ids["dupe"], observation_api.ReplaceRequest(path=held)),
+                  409, "not_near")
+    got = await replace(ids["close"], observation_api.ReplaceRequest(path=held))
+    new = tmp / "lib" / "close"
+    assert got["path"] == str(new) and new.exists() and not Path(held).exists()
+    assert not (tmp / "inbox" / "close").exists()
+    assert await conn.fetchval("SELECT array_agg(path) FROM work_paths WHERE work_id = $1 "
+                               "AND present", held_id) == [str(new)]
+    assert await conn.fetchval("SELECT path FROM scan_jobs WHERE id = $1",
+                               got["job_id"]) == str(new)
+    await refused(replace(ids["close"], observation_api.ReplaceRequest(path=held)), 404)
+    print("  ok  replace: only a near match, the work keeps its id at the new name, "
+          "and a scan is queued")
+
+
 async def test_endpoints_and_guard(conn, tmp: Path) -> None:
     """Creating and forgetting a check, and which items preview may read."""
     (tmp / "note.txt").write_text("x")
     for paths, code in (([], "paths_required"), ([str(tmp / "note.txt")], "not_registrable"),
-                        ([str(tmp / "lib" / "held")], "inside_collections")):
+                        ([str(tmp / "lib" / "close")], "inside_collections")):
         await refused(observation_api.create_check_job(
             observation_api.CheckJobRequest(paths=paths)), 400, code)
     made = await observation_api.create_check_job(observation_api.CheckJobRequest(
@@ -173,7 +196,7 @@ async def test_endpoints_and_guard(conn, tmp: Path) -> None:
     await refused(observation_api.forget_check_job(made["job_id"]), 404, "check_not_found")
     print("  ok  a check job refuses empty, non-work and in-library items, and is forgotten once")
 
-    inside, outside = tmp / "inbox" / "close", work(tmp / "elsewhere")
+    inside, outside = tmp / "inbox" / "fresh", work(tmp / "elsewhere")
     catalog_api._forget_check_roots()
     assert await catalog_api._readable(str(inside)) == inside
     await refused(catalog_api._readable(str(outside)), 403)
@@ -184,7 +207,7 @@ async def test_endpoints_and_guard(conn, tmp: Path) -> None:
 
 
 async def cleanup(conn) -> None:
-    await conn.execute("DELETE FROM scan_jobs WHERE kind = 'check'")
+    await conn.execute("DELETE FROM scan_jobs WHERE kind = 'check' OR path LIKE '%lib%close'")
     await conn.execute("DELETE FROM works WHERE id IN (SELECT work_id FROM work_paths "
                        "WHERE collection = $1)", COLL)
     await conn.execute("DELETE FROM scan_runs WHERE params->>'test' = 'test_check'")
@@ -210,6 +233,7 @@ async def main() -> None:
             test_stream_work_without_a_collection(tmp)
             held_id = await test_tiers(conn, tmp)
             await test_discard_needs_a_live_library_copy(conn, tmp, held_id)
+            await test_replace_keeps_the_work(conn, tmp, held_id)
             await test_endpoints_and_guard(conn, tmp)
     finally:
         trash.recycle = real

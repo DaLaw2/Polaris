@@ -46,7 +46,22 @@ const similarRef = ref('')
 const similarMode = ref('similar')
 
 const view = ref('works')
-const copiesFlag = () => view.value === 'copies' ? '&copies=true' : ''
+const NEAR_KEY = 'polaris:near'
+const readNear = v => {
+  const x = Number(v)
+  return x >= 0.5 && x <= 1 ? x : null
+}
+let savedNear = null
+try { savedNear = readNear(localStorage.getItem(NEAR_KEY)) } catch {}
+const near = ref(savedNear ?? 0.97)
+function setNear(v) {
+  const x = readNear(v)
+  if (x === null || x === near.value) return
+  near.value = x
+  try { localStorage.setItem(NEAR_KEY, String(x)) } catch {}
+  search(true)
+}
+const copiesFlag = () => view.value === 'copies' ? `&copies=true&near=${near.value}` : ''
 
 const checkJob = ref(null)
 const checkJobs = ref([])
@@ -262,6 +277,7 @@ function toQuery() {
   }
   if (view.value !== 'works') p.set('view', view.value)
   if (view.value === 'check' && checkJob.value) p.set('job', String(checkJob.value))
+  if (view.value !== 'works') p.set('near', String(near.value))
   if (selectedWork.value) p.set('work', selectedWork.value.folder_path)
   if (reading.value) p.set('read', reading.value.path)
   return Object.fromEntries(p)
@@ -278,6 +294,7 @@ function fromQuery(q) {
   similarRef.value = q.similar || ''
   similarMode.value = q.simMode || 'similar'
   view.value = ['copies', 'check'].includes(q.view) ? q.view : 'works'
+  near.value = readNear(q.near) ?? near.value
   checkJob.value = q.job ? Number(q.job) : checkJob.value
 }
 
@@ -320,6 +337,17 @@ function buildParams() {
   p.set('limit', String(pageSize.value))
   p.set('offset', String(page.value * pageSize.value))
   return p
+}
+
+async function pickRandom() {
+  const p = buildParams()
+  p.set('limit', '1')
+  p.set('offset', String(Math.floor(Math.random() * total.value)))
+  try {
+    const d = await api(`/api/search/faceted?${p}&facets=false`)
+    const w = d.results[0]?.work
+    if (w && selectedWork.value?.folder_path !== w.folder_path) showDetail(w)
+  } catch (e) { error.value = `查詢失敗: ${e.message}` }
 }
 
 let seq = 0
@@ -381,6 +409,17 @@ async function searchSimilar() {
   }
 }
 
+function checkLabel(j) {
+  const ps = j.paths || (j.path ? [j.path] : [])
+  const leaf = p => p.split(/[\\/]/).filter(Boolean).pop() || p
+  const up = p => p.replace(/[\\/][^\\/]*[\\/]?$/, '')
+  const at = j.requested_at ? new Date(j.requested_at).toLocaleString('zh-TW', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : ''
+  const what = ps.length <= 1 ? leaf(ps[0] || '')
+    : new Set(ps.map(up)).size === 1 ? `${leaf(up(ps[0]))} 內 ${ps.length} 項`
+    : `${leaf(ps[0])} 等 ${ps.length} 項`
+  return [`#${j.id}`, at, what].filter(Boolean).join(' · ')
+}
+
 async function loadCheckJobs() {
   const d = await api('/api/scan/jobs?kind=check&limit=20')
   checkJobs.value = d.jobs
@@ -415,6 +454,7 @@ async function searchCheck() {
     }
     const q = new URLSearchParams()
     if (checkFilter.value) q.set('verdict', checkFilter.value)
+    q.set('near', String(near.value))
     q.set('limit', String(pageSize.value))
     q.set('offset', String(page.value * pageSize.value))
     const d = await api(`/api/check/jobs/${checkJob.value}/items?${q}`)
@@ -434,7 +474,7 @@ async function searchCheck() {
         },
         ...it.matches.map(m => ({
           path: m.work.folder_path, collection: m.work.collection,
-          copy: true, exists: true, bytes: null, locked: true,
+          copy: true, exists: m.bytes != null, bytes: m.bytes,
           score: m.score,
         })),
       ],
@@ -496,25 +536,41 @@ async function revealPlace(p) {
   catch (e) { error.value = e.message }
 }
 
-const discardOne = p => p.item_id
-  ? api(`/api/check/items/${p.item_id}/discard`, { method: 'POST' })
-  : api('/api/copies/discard', { method: 'POST', body: { path: p.path } })
+const replaces = p => view.value === 'check' && p.copy
 
-async function discardPlace(p) {
-  if (!confirm(`把這份丟進資源回收筒？\n\n${p.path}\n${formatBytes(p.bytes)}`)) return
+const removable = (r, p) => p.exists && (view.value !== 'check'
+  || !p.copy || (r.verdict === 'near' && r.places[0].exists))
+
+const removeOne = (r, p) => replaces(p)
+  ? api(`/api/check/items/${r.places[0].item_id}/replace`, { method: 'POST', body: { path: p.path, near: near.value } })
+  : p.item_id
+    ? api(`/api/check/items/${p.item_id}/discard?near=${near.value}`, { method: 'POST' })
+    : api('/api/copies/discard', { method: 'POST', body: { path: p.path, kept: keptPlace(r, p) } })
+
+const keptPlace = (r, p) =>
+  r.places.find(q => q !== p && q.exists && !picked.has(q.path))?.path
+  ?? r.places.find(q => q !== p && q.exists)?.path
+
+function keptText(r, p) {
+  if (replaces(p)) return `保留：${r.places[0].path}\n（搬到刪除的這份原本的位置，重新掃描）`
+  return r.places.filter(q => q !== p && q.exists).map(q => `保留：${q.path}`).join('\n')
+}
+
+async function removePlace(r, p) {
+  if (!confirm(`刪除這份？\n\n刪除：${p.path}（${formatBytes(p.bytes)}）\n${keptText(r, p)}\n\n刪除的會進資源回收筒。`)) return
   discarding.value = p.path
   error.value = ''
   try {
-    await discardOne(p)
+    await removeOne(r, p)
     await search(false)
   } catch (e) { error.value = e.message }
   discarding.value = ''
 }
 
 const pickedIn = r => (r.places || []).filter(p => picked.has(p.path)).length
-const canPick = (r, p) => view.value === 'check'
-  ? (!p.locked && p.exists)
-  : picked.has(p.path) || (p.exists && alive(r) - pickedIn(r) > 1)
+const canPick = (r, p) => picked.has(p.path) || (removable(r, p) && (view.value === 'check'
+  ? pickedIn(r) === 0
+  : alive(r) - pickedIn(r) > 1))
 
 function togglePick(r, p) {
   if (picked.has(p.path)) picked.delete(p.path)
@@ -526,19 +582,19 @@ function endBatch() {
   picked.clear()
 }
 
-const pickedPlaces = computed(() =>
-  results.value.flatMap(r => (r.places || []).filter(p => picked.has(p.path))))
+const pickedPairs = computed(() =>
+  results.value.flatMap(r => (r.places || []).filter(p => picked.has(p.path)).map(p => ({ r, p }))))
 const pickedBytes = computed(() =>
-  pickedPlaces.value.reduce((n, p) => n + (p.bytes || 0), 0))
+  pickedPairs.value.reduce((n, { p }) => n + (p.bytes || 0), 0))
 
-async function discardPicked() {
-  const todo = [...pickedPlaces.value].sort((a, b) => b.copy - a.copy)
-  if (!confirm(`把 ${todo.length} 份丟進資源回收筒？共 ${formatBytes(pickedBytes.value)}`)) return
+async function removePicked() {
+  const todo = [...pickedPairs.value].sort((a, b) => b.p.copy - a.p.copy)
+  if (!confirm(`刪除 ${todo.length} 份？共 ${formatBytes(pickedBytes.value)}\n\n每件都會保留一份，刪除的會進資源回收筒。`)) return
   error.value = ''
   const failed = []
-  for (const [i, p] of todo.entries()) {
+  for (const [i, { r, p }] of todo.entries()) {
     discarding.value = `${i + 1}/${todo.length}`
-    try { await discardOne(p) }
+    try { await removeOne(r, p) }
     catch (e) { failed.push(`${p.path}：${e.message}`) }
   }
   discarding.value = ''
@@ -904,6 +960,11 @@ onMounted(async () => {
         <span :class="{ on: view === 'copies' }" @click="setView('copies')">重複</span>
         <span :class="{ on: view === 'check' }" @click="setView('check')">檢查</span>
       </label>
+      <label class="nearbox" v-if="view !== 'works'" title="相似度達到這個值才算重複">
+        相似度
+        <input type="number" class="select" min="0.5" max="1" step="0.01"
+               :value="near" @change="setNear($event.target.value)" />
+      </label>
 
       <div class="head-actions">
         <select v-model="pageSize" class="select" title="一頁顯示幾筆">
@@ -916,6 +977,8 @@ onMounted(async () => {
           <option value="title">標題</option>
           <option value="pages">頁數</option>
         </select>
+        <button v-if="view === 'works' && !similarRef" class="select" :disabled="!total"
+                title="從目前的結果中隨機挑一部" @click="pickRandom">隨機</button>
         <RouterLink to="/" class="go">管理</RouterLink>
       </div>
     </header>
@@ -984,14 +1047,14 @@ onMounted(async () => {
         <div class="resbar">
           <span v-if="loading">搜尋中…</span>
           <span v-else-if="similarRef && results.length">最相似的 {{ results.length }} 本</span>
-          <span v-else>{{ total }} {{ view === 'copies' ? '件有複本的作品' : view === 'check' ? '項檢查結果' : '筆結果' }}<template v-if="totalPages > 1">，第 {{ page + 1 }} / {{ totalPages }} 頁</template></span>
+          <span v-else>{{ total }} {{ view === 'copies' ? '組重複' : view === 'check' ? '項檢查結果' : '筆結果' }}<template v-if="totalPages > 1">，第 {{ page + 1 }} / {{ totalPages }} 頁</template></span>
         </div>
 
         <div class="batchbar checkbar" v-if="view === 'check'">
           <select class="select" :value="checkJob || ''"
                   @change="setCheckJob($event.target.value)">
             <option v-if="!checkJobs.length" value="">還沒有檢查過任何資料夾</option>
-            <option v-for="j in checkJobs" :key="j.id" :value="j.id">{{ j.path || (j.paths || []).join('、') }}</option>
+            <option v-for="j in checkJobs" :key="j.id" :value="j.id">{{ checkLabel(j) }}</option>
           </select>
           <span v-if="checkRun && (checkRun.state === 'queued' || checkRun.state === 'running')">
             檢查中 {{ checkRun.done }} / {{ checkRun.total || '?' }}
@@ -1007,10 +1070,10 @@ onMounted(async () => {
         <div class="batchbar" v-if="view !== 'works' && results.length">
           <button class="mini" v-if="!batch" @click="batch = true">批次選擇</button>
           <template v-else>
-            <span>已選 {{ pickedPlaces.length }} 份（{{ formatBytes(pickedBytes) }}）<template v-if="view === 'copies'">，每件作品至少留一份</template></span>
-            <button class="btn del" :disabled="!pickedPlaces.length || !!discarding"
-                    @click="discardPicked">
-              {{ discarding ? `刪除中 ${discarding}` : '丟進回收筒' }}
+            <span>已選 {{ pickedPairs.length }} 份（{{ formatBytes(pickedBytes) }}），每件至少保留一份</span>
+            <button class="btn del" :disabled="!pickedPairs.length || !!discarding"
+                    @click="removePicked">
+              {{ discarding ? `刪除中 ${discarding}` : '刪除' }}
             </button>
             <button class="btn" :disabled="!!discarding" @click="endBatch">取消</button>
           </template>
@@ -1116,7 +1179,7 @@ onMounted(async () => {
                     選取
                   </label>
                   <span :class="['duptag', p.copy ? 'copy' : 'main']">
-                    {{ view === 'check' ? (p.copy ? '庫裡已有' : '這一份') : (p.copy ? '複本' : '主要') }}
+                    {{ view === 'check' ? (p.copy ? '庫裡已有' : '這一份') : p.score != null ? '相似作品' : (p.copy ? '複本' : '主要') }}
                   </span>
                   <span>{{ p.collection }}</span>
                   <span v-if="p.score">相似 {{ (p.score * 100).toFixed(0) }}</span>
@@ -1125,10 +1188,10 @@ onMounted(async () => {
                 <div class="loc">{{ p.path }}</div>
                 <div class="dupacts">
                   <button class="mini" :disabled="!p.exists" @click="revealPlace(p)">在檔案總管中顯示</button>
-                  <button class="mini del" v-if="!batch && !p.locked"
-                          :disabled="!p.exists || (view === 'copies' && alive(r) < 2) || !!discarding"
-                          @click="discardPlace(p)">
-                    {{ discarding === p.path ? '刪除中…' : '丟進回收筒' }}
+                  <button class="mini del" v-if="!batch && (view !== 'check' || !p.copy || r.verdict === 'near')"
+                          :disabled="!removable(r, p) || (view === 'copies' && alive(r) < 2) || !!discarding"
+                          @click="removePlace(r, p)">
+                    {{ discarding === p.path ? '刪除中…' : '刪除這份' }}
                   </button>
                 </div>
               </div>
@@ -1327,6 +1390,8 @@ onMounted(async () => {
 
 <style>
 .viewswitch { flex-shrink: 0; }
+.nearbox { display: flex; align-items: center; gap: 0.35rem; flex-shrink: 0; font-size: 0.78rem; color: var(--text2); }
+.nearbox input { width: 4.8rem; padding: 0.28rem 0.4rem; }
 .duprows { display: flex; flex-direction: column; }
 .duprow {
   display: grid; grid-template-columns: 17rem minmax(0, 1fr); gap: 1.2rem;

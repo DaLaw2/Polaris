@@ -9,6 +9,7 @@ from _common import dsn, refused
 DSN = dsn()
 
 import asyncpg  # noqa: E402
+import numpy as np  # noqa: E402
 
 from polaris import config, state  # noqa: E402
 from polaris.catalog import api as catalog_api  # noqa: E402
@@ -16,6 +17,7 @@ from polaris.catalog import identity, trash  # noqa: E402
 from polaris.observation import ingest  # noqa: E402
 from polaris.observation.domain import Sample, WorkObservation  # noqa: E402
 from polaris.search import api as search_api  # noqa: E402
+from polaris.search import near  # noqa: E402
 from polaris.search.engine import SearchEngine  # noqa: E402
 
 COLL, GONE = "copies-test", "absence-test"
@@ -150,6 +152,13 @@ async def test_discard_and_search(conn, run, tmp, k) -> None:
     assert not m.exists() and (await where(conn, w))[0] == [str(o)]
     print("  ok  a copy goes; the last one is refused; a copy takes over the work")
 
+    p = tmp / "p"
+    other = await ingest.record_observation(conn, run, seen(p, k + "9"))
+    await refused(catalog_api.discard_copy(catalog_api.DiscardRequest(path=str(p))), 409)
+    await catalog_api.discard_copy(catalog_api.DiscardRequest(path=str(p), kept=str(o)))
+    assert not p.exists() and await where(conn, other) == ([], [])
+    print("  ok  a work's last place goes only when a look-alike is named as kept")
+
     held = {r["path"] for r in await conn.fetch(
         "SELECT p.path FROM work_paths p WHERE p.present AND p.collection = $1 "
         "AND EXISTS (SELECT 1 FROM work_copies c WHERE c.work_id = p.work_id)",
@@ -165,6 +174,14 @@ async def test_discard_and_search(conn, run, tmp, k) -> None:
         row[0]["path"] == path and not row[0]["copy"] and any(p["copy"] for p in row[1:])
         for path, row in places.items())
     print(f"  ok  copies=True finds the {len(held)} works with copies, with places")
+
+
+def test_near_groups() -> None:
+    """A work joins a group only by its likeness to the leader."""
+    v = np.array([[1, 0], [1, .05], [1, .3], [0, 1]], np.float32)
+    assert {a: [b for b, _ in m] for a, m in near.group([1, 2, 3, 4], v, .95).items()}         == {1: [2, 3]}
+    assert {a: [b for b, _ in m] for a, m in near.group([1, 2, 3, 4], v, .965).items()}         == {1: [2]}
+    print("  ok  near groups gather around a leader and never chain")
 
 
 def test_trash_refuses(tmp) -> None:
@@ -191,6 +208,7 @@ async def main() -> None:
         with tempfile.TemporaryDirectory() as t:
             tmp, k = Path(t), Path(t).name + ":"
             test_trash_refuses(tmp)
+            test_near_groups()
             trash.recycle = lambda path, size: shutil.rmtree(path)
             await cleanup(conn)
             await conn.execute("INSERT INTO collections (name, root) VALUES ($1, $2)",

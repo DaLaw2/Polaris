@@ -2,6 +2,7 @@
 
 import asyncio
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
@@ -10,6 +11,7 @@ from polaris import state
 from polaris.catalog.api import _size
 from polaris.search import queries
 from polaris.search.engine import LEAD
+from polaris.search.near import groups as near_groups
 from polaris.vocabulary.api import (
     _author_display_cache,
     _series_display_cache,
@@ -204,6 +206,8 @@ async def search_faceted(
                     "'all' for every collection",
     ),
     copies: bool = Query(False, description="Only works a second path repeats"),
+    near: Annotated[float | None, Query(
+        ge=0.5, le=1.0, description="With copies: also works this alike")] = None,
 ):
     """Multi-dimensional search with facet counts.
 
@@ -224,6 +228,11 @@ async def search_faceted(
         """
         parts = raw.split(",") if "," in raw else raw.split()
         return [p.strip() for p in parts if p.strip()]
+
+    groups = {}
+    if copies and near is not None:
+        async with state.store.acquire() as conn:
+            groups = await near_groups(conn, near)
 
     terms = _split(q)
     resolved = []
@@ -252,6 +261,7 @@ async def search_faceted(
         with_facets=facets,
         collection=_collection(collection),
         copies=copies,
+        near=list(groups),
     )
 
     items = []
@@ -262,7 +272,7 @@ async def search_faceted(
         ))
 
     if copies:
-        await _attach_places(items)
+        await _attach_places(items, groups)
     return {
         "results": items,
         "total": payload["total"],
@@ -349,37 +359,50 @@ async def stats():
         return await queries.stats(conn)
 
 
-async def _places(paths: list[str]) -> dict[str, list[dict]]:
-    """Each work's own path and every copy of it, keyed by the work's path.
+async def _places(paths: list[str],
+                  near: dict[int, list[tuple[int, float]]] | None = None
+                  ) -> dict[str, list[dict]]:
+    """Each work's own path, every copy of it, and the works that look
+    like it when `near` names them, keyed by the work's path.
 
     Read against the disk now -- sizes, and whether each is still there --
     so a copy deleted since the last scan says so instead of waiting for
     one.
     """
+    near = near or {}
     async with state.store.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT p.path, p.collection, "
-            "       array_agg(c.path ORDER BY c.path) AS copies, "
-            "       array_agg(c.collection ORDER BY c.path) AS colls "
-            "FROM work_paths p JOIN work_copies c ON c.work_id = p.work_id "
+            "SELECT p.path, p.collection, p.work_id, "
+            "       array_remove(array_agg(c.path ORDER BY c.path), NULL) AS copies, "
+            "       array_remove(array_agg(c.collection ORDER BY c.path), NULL) AS colls "
+            "FROM work_paths p LEFT JOIN work_copies c ON c.work_id = p.work_id "
             "WHERE p.present AND p.path = ANY($1::text[]) "
-            "GROUP BY p.path, p.collection", paths)
+            "GROUP BY p.path, p.collection, p.work_id", paths)
+        members = {m for r in rows for m, _ in near.get(r["work_id"], ())}
+        where = {r["work_id"]: r for r in await conn.fetch(
+            "SELECT DISTINCT ON (work_id) work_id, path, collection "
+            "FROM work_paths WHERE present AND work_id = ANY($1::int[]) "
+            "ORDER BY work_id, last_seen DESC", list(members))}
 
-    def place(path, collection, copy):
+    def place(path, collection, copy, score=None):
         size = _size(Path(path))
         return {"path": path, "collection": collection, "copy": copy,
-                "exists": size is not None, "bytes": size}
+                "exists": size is not None, "bytes": size, "score": score}
 
     def measure():
         return {r["path"]: [place(r["path"], r["collection"], False)]
                 + [place(c, k, True) for c, k in zip(r["copies"], r["colls"])]
+                + [place(where[m]["path"], where[m]["collection"], True, s)
+                   for m, s in near.get(r["work_id"], ()) if m in where]
                 for r in rows}
 
     return await asyncio.to_thread(measure)
 
 
-async def _attach_places(items: list["SearchResultItem"]) -> None:
+async def _attach_places(items: list["SearchResultItem"],
+                         near: dict[int, list[tuple[int, float]]] | None = None
+                         ) -> None:
     """Fill `places` on a page of results, in one query."""
-    found = await _places([i.work.folder_path for i in items])
+    found = await _places([i.work.folder_path for i in items], near)
     for i in items:
         i.places = found.get(i.work.folder_path, [])

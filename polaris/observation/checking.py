@@ -149,10 +149,10 @@ def job_body(pipeline_factory: "scanning.PipelineFactory",
                           f"library has {dims})")
             else:
                 rows = await conn.fetch(KNN, vec, version["id"], NEAR_TOP)
-                hits = [(r["id"], float(r["score"])) for r in rows
-                        if float(r["score"]) >= near]
+                hits = [(r["id"], float(r["score"])) for r in rows]
+                close = any(score >= near for _, score in hits)
                 await _record(conn, job["id"], target,
-                              "near" if hits else "new", embedding=vec,
+                              "near" if close else "new", embedding=vec,
                               version_id=version["id"], matches=hits)
             done += 1
             stop = await worker.beat(conn, job["id"], done=done,

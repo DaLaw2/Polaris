@@ -364,6 +364,7 @@ class SearchEngine:
         with_facets: bool = True,
         collection: str | None = LEAD,
         copies: bool = False,
+        near: list[int] | None = None,
     ) -> dict:
         """Search across every dimension at once, with facet counts.
 
@@ -386,6 +387,8 @@ class SearchEngine:
                 that belongs to a collection the results cannot contain.
             copies: Only works a second path repeats. The facet counts
                 follow it too.
+            near: With `copies`, these works count too: the leaders of
+                near-duplicate groups.
 
         Returns:
             {"results": [SearchResult], "total": int, "facets": {...}}
@@ -421,7 +424,8 @@ class SearchEngine:
                 f"({off} OR w.collection = ANY({_bind(collection)}::text[]))")
 
         if copies:
-            conditions.append(HAS_COPIES)
+            conditions.append(
+                f"({HAS_COPIES} OR w.id = ANY({_bind(near or [])}::int[]))")
 
         for field, values in enums.items():
             conditions.append(f"w.{field} = ANY({_bind(values)}::text[])")

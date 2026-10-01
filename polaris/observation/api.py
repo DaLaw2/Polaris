@@ -1,13 +1,15 @@
 """HTTP endpoints for scan jobs, check jobs and reindexing."""
 
 import asyncio
+import shutil
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from polaris import config, state
-from polaris.catalog import trash
+from polaris.catalog import identity, trash
 from polaris.catalog.api import _forget_check_roots, _readable, _size
 from polaris.jobs import worker
 from polaris.models.api import _profile_id
@@ -220,32 +222,56 @@ async def create_check_job(req: CheckJobRequest):
     return {"job_id": job_id, "state": "queued", "paths": req.paths}
 
 
+_VERDICTS = """
+WITH v AS (
+    SELECT i.*, CASE WHEN i.verdict IN ('near', 'new') THEN
+        CASE WHEN EXISTS (SELECT 1 FROM check_matches m
+                          WHERE m.item_id = i.id AND m.score >= $2)
+             THEN 'near' ELSE 'new' END
+        ELSE i.verdict END AS seen
+    FROM check_items i WHERE i.job_id = $1)
+"""
+
+
+async def _near(conn, job_id: int, near: float | None) -> float:
+    """The likeness a match needs: the one asked for, else the check's own."""
+    if near is not None:
+        return near
+    return float(await conn.fetchval(
+        "SELECT (params->>'near')::float FROM scan_jobs WHERE id = $1",
+        job_id) or 0.92)
+
+
 @router.get("/api/check/jobs/{job_id}/items")
 async def check_job_items(job_id: int, verdict: str | None = Query(None),
                           limit: int = Query(50, ge=1, le=200),
-                          offset: int = Query(0, ge=0)):
-    """What a check concluded, duplicates first."""
+                          offset: int = Query(0, ge=0),
+                          near: Annotated[float | None, Query(ge=0.5, le=1.0)] = None):
+    """What a check concluded, duplicates first; a match counts when it is
+    at least `near` alike."""
     async with state.store.acquire() as conn:
         job = await conn.fetchrow(
             f"SELECT {worker.JOB_COLUMNS} "
             "FROM scan_jobs WHERE id = $1 AND kind = 'check'", job_id)
         if job is None:
             raise refuse(404, "check_not_found", "no such check")
-        counts = {r["verdict"]: r["n"] for r in await conn.fetch(
-            "SELECT verdict, COUNT(*) n FROM check_items WHERE job_id = $1 "
-            "GROUP BY verdict", job_id)}
+        near = await _near(conn, job_id, near)
+        counts = {r["seen"]: r["n"] for r in await conn.fetch(
+            _VERDICTS + "SELECT seen, COUNT(*) n FROM v GROUP BY seen",
+            job_id, near)}
         rows = await conn.fetch(
-            "SELECT id, path, bytes, verdict, error,"
+            _VERDICTS +
+            "SELECT id, path, bytes, seen AS verdict, error,"
             "       discarded_at IS NOT NULL AS discarded "
-            "FROM check_items "
-            "WHERE job_id = $1 AND ($2::text IS NULL OR verdict = $2) "
+            "FROM v WHERE ($3::text IS NULL OR seen = $3) "
             "ORDER BY array_position("
-            "    ARRAY['same','near','new','error'], verdict), path "
-            "LIMIT $3 OFFSET $4", job_id, verdict, limit, offset)
+            "    ARRAY['same','near','new','error'], seen), path "
+            "LIMIT $4 OFFSET $5", job_id, near, verdict, limit, offset)
         matches = await conn.fetch(
             "SELECT item_id, work_id, score FROM check_matches "
             "WHERE item_id = ANY($1::bigint[]) "
-            "ORDER BY score DESC NULLS LAST", [r["id"] for r in rows])
+            "  AND (score IS NULL OR score >= $2) "
+            "ORDER BY score DESC NULLS LAST", [r["id"] for r in rows], near)
 
         ids = sorted({m["work_id"] for m in matches})
         by_work = await queries.tags_by_work(conn, ids)
@@ -257,12 +283,14 @@ async def check_job_items(job_id: int, verdict: str | None = Query(None),
         analysis = queries.row_to_work(row, by_work.get(row["id"], []))
         works[row["id"]] = await _work_to_item_resolved(analysis)
 
+    sizes = await asyncio.to_thread(
+        lambda: {i: _size(Path(w.folder_path)) for i, w in works.items()})
     hits: dict[int, list] = {}
     for m in matches:
         item = works.get(m["work_id"])
         if item is not None:
             hits.setdefault(m["item_id"], []).append(
-                {"work": item,
+                {"work": item, "bytes": sizes[m["work_id"]],
                  "score": None if m["score"] is None else float(m["score"])})
 
     return {
@@ -274,21 +302,27 @@ async def check_job_items(job_id: int, verdict: str | None = Query(None),
 
 
 @router.post("/api/check/items/{item_id}/discard")
-async def discard_check_item(item_id: int):
+async def discard_check_item(item_id: int,
+                             near: Annotated[float | None, Query(ge=0.5, le=1.0)] = None):
     """Send one checked item to the Recycle Bin.
 
-    Refused unless the library's own copy of what it matched is still on
-    disk: that, and not a row, is what makes this not the last one. A
-    verdict with no match is not deletable from here at all.
+    Refused unless the library's own copy of what it matched, at least
+    `near` alike, is still on disk: that, and not a row, is what makes
+    this not the last one. An item with no such match is not deletable
+    from here at all.
     """
     async with state.store.acquire() as conn:
+        job_id = await conn.fetchval(
+            "SELECT job_id FROM check_items WHERE id = $1", item_id)
+        near = await _near(conn, job_id, near)
         row = await conn.fetchrow(
             "SELECT i.path, i.discarded_at, p.path AS kept "
             "FROM check_items i "
             "JOIN check_matches m ON m.item_id = i.id "
+            "    AND (m.score IS NULL OR m.score >= $2) "
             "JOIN work_paths p ON p.work_id = m.work_id AND p.present "
             "WHERE i.id = $1 ORDER BY m.score DESC NULLS LAST LIMIT 1",
-            item_id)
+            item_id, near)
         if row is None:
             raise refuse(404, "no_match",
                          "this item matched nothing the library still holds")
@@ -308,6 +342,85 @@ async def discard_check_item(item_id: int):
             "UPDATE check_items SET discarded_at = NOW() WHERE id = $1",
             item_id)
     return {"discarded": row["path"], "kept": row["kept"]}
+
+
+class ReplaceRequest(BaseModel):
+    """The library path a checked item takes the place of, and how alike
+    a match must be."""
+
+    path: str
+    near: float | None = None
+
+
+@router.post("/api/check/items/{item_id}/replace")
+async def replace_with_check_item(item_id: int, req: ReplaceRequest):
+    """Put a checked item where the library copy it resembles was, under
+    the item's own name, and send that copy to the Recycle Bin.
+
+    The work keeps its id and what people said about it; a forced scan of
+    the new path observes the new content. Only a near match: an
+    identical one has nothing to replace.
+    """
+    async with state.store.acquire() as conn:
+        job_id = await conn.fetchval(
+            "SELECT job_id FROM check_items WHERE id = $1", item_id)
+        near = await _near(conn, job_id, req.near)
+        row = await conn.fetchrow(
+            "SELECT i.path, m.score, i.discarded_at, p.work_id, p.collection "
+            "FROM check_items i "
+            "JOIN check_matches m ON m.item_id = i.id "
+            "    AND (m.score IS NULL OR m.score >= $3) "
+            "JOIN work_paths p ON p.work_id = m.work_id AND p.present "
+            "    AND p.path = $2 "
+            "WHERE i.id = $1", item_id, req.path, near)
+        if row is None:
+            raise refuse(404, "no_match",
+                         "this item did not match that library path",
+                         path=req.path)
+        if row["score"] is None:
+            raise refuse(409, "not_near",
+                         "only a near match is replaced; discard an identical one")
+        if row["discarded_at"] is not None:
+            raise refuse(409, "already_discarded", "already discarded")
+        item = await _readable(row["path"])
+        kept = Path(req.path)
+        if not await asyncio.to_thread(kept.exists):
+            raise refuse(409, "library_copy_missing",
+                         "the library's own copy is not on disk", path=req.path)
+        dest = kept.parent / item.name
+        if dest != kept and await asyncio.to_thread(dest.exists):
+            raise refuse(409, "name_taken", f"{dest} already exists",
+                         path=str(dest))
+        pid = await _profile_id(conn, None)
+        try:
+            params = await scanning.freeze(conn, pid, force=True)
+        except ValueError as e:
+            raise refuse(400, "profile_has_no_members", str(e)) from None
+
+        staged = kept.parent / f".polaris-replace-{item_id}"
+        try:
+            await asyncio.to_thread(shutil.move, item, staged)
+        except OSError as e:
+            raise refuse(409, "move_failed", str(e), path=str(item))
+        try:
+            await asyncio.to_thread(trash.recycle, kept, _size(kept) or 0)
+        except trash.Refused as e:
+            await asyncio.to_thread(shutil.move, staged, item)
+            raise refuse(409, "recycle_refused", str(e))
+        await asyncio.to_thread(staged.rename, dest)
+
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE work_paths SET present = FALSE "
+                "WHERE work_id = $1 AND path = $2", row["work_id"], req.path)
+            await identity.record_path(conn, row["work_id"], str(dest),
+                                       row["collection"])
+            await conn.execute(
+                "UPDATE check_items SET discarded_at = NOW() WHERE id = $1",
+                item_id)
+            job_id = await worker.enqueue(conn, "scan", path=str(dest),
+                                          params=params, model_profile_id=pid)
+    return {"replaced": req.path, "path": str(dest), "job_id": job_id}
 
 
 @router.delete("/api/check/jobs/{job_id}")
