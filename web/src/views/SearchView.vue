@@ -149,7 +149,15 @@ function setEnum(kind, rows) {
 
 for (const [kind, rows] of Object.entries(FALLBACK_ENUMS)) setEnum(kind, rows)
 
+const NAMES = reactive({ artist: {}, series: {} })
+
 async function loadEnums() {
+  await Promise.all(Object.keys(NAMES).map(async kind => {
+    try {
+      const rows = await (await fetch(`/api/concepts?kind=${kind}`)).json()
+      if (Array.isArray(rows)) NAMES[kind] = Object.fromEntries(rows.filter(c => c.display).map(c => [c.slug, c.display]))
+    } catch {}
+  }))
   await Promise.all(Object.keys(FALLBACK_ENUMS).map(async kind => {
     try {
       const res = await fetch(`/api/concepts?kind=${kind}`)
@@ -235,7 +243,7 @@ const activeChips = computed(() => {
   for (const t of f.notTags) out.push({ label: '− ' + tr(t), raw: t, dim: 'notTags', kind: 'not' })
   for (const s of SECTIONS) {
     if (s.kind === 'text') {
-      if (f[s.key]) out.push({ label: `${s.label}: ${f[s.key]}`, raw: f[s.key], dim: s.key, kind: 'text' })
+      if (f[s.key]) out.push({ label: `${s.label}: ${NAMES[s.key]?.[f[s.key]] || f[s.key]}`, raw: f[s.key], dim: s.key, kind: 'text' })
     } else if (s.key !== 'general') {
       for (const v of f[s.key]) {
         out.push({ label: `${s.label}: ${VALUE_LABELS[v] || tr(v)}`, raw: v, dim: s.key, kind: 'multi' })
@@ -858,7 +866,7 @@ function tr(tag) {
   return tag.replace(/_/g, ' ')
 }
 function label(key, value) {
-  return VALUE_LABELS[value] || (SECTIONS.find(s => s.key === key)?.tagLike ? tr(value) : value)
+  return NAMES[key]?.[value] || VALUE_LABELS[value] || (SECTIONS.find(s => s.key === key)?.tagLike ? tr(value) : value)
 }
 function coverUrl(work, w = 480) {
   return `/api/cover?path=${encodeURIComponent(work.folder_path)}&w=${w}`
