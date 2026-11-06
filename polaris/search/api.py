@@ -282,59 +282,95 @@ async def search_faceted(
     }
 
 
-@router.get("/api/similar", response_model=list[SearchResultItem])
+def _sim_filters(artist, series, rating, color_mode, work_type, language):
+    text = {}
+    if artist:
+        text["artist"] = artist
+    if series:
+        text["series"] = series
+    enums = {}
+    for k, v in [("rating", rating), ("color_mode", color_mode),
+                 ("work_type", work_type), ("language", language)]:
+        if v:
+            enums[k] = [x.strip() for x in v.split(",") if x.strip()]
+    return text or None, enums or None
+
+
+@router.get("/api/similar")
 async def similar(
     path: str = Query(..., description="Folder path of reference work"),
     embedding: str = Query("style", description="style or wd"),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     collection: str = Query(""),
     copies: bool = Query(False),
+    artist: str = Query(""),
+    series: str = Query(""),
+    rating: str = Query(""),
+    color_mode: str = Query(""),
+    work_type: str = Query(""),
+    language: str = Query(""),
 ):
-    """Find works with similar visual style."""
+    """Find works with similar visual style, with filters and pagination."""
     await _sync_vocabulary()
-    results = await state.engine.search_similar(
+    text, enums = _sim_filters(artist, series, rating, color_mode, work_type, language)
+    data = await state.engine.search_similar(
         reference_path=path,
         embedding_type=embedding,
-        top_k=limit,
+        limit=limit,
+        offset=offset,
         collection=_collection(collection),
         copies=copies,
+        text=text,
+        enums=enums,
     )
     items = []
-    for r in results:
+    for r in data["results"]:
         item = await _work_to_item_resolved(r.work)
         items.append(SearchResultItem(work=item, score=r.score))
     if copies:
         await _attach_places(items)
-    return items
+    return {"results": items, "total": data["total"]}
 
 
-@router.get("/api/hybrid", response_model=list[SearchResultItem])
+@router.get("/api/hybrid")
 async def hybrid(
     q: str = Query(..., description="Tag filter terms"),
     similar_to: str = Query(..., description="Folder path for similarity"),
     embedding: str = Query("style"),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     collection: str = Query(""),
     copies: bool = Query(False),
+    artist: str = Query(""),
+    series: str = Query(""),
+    rating: str = Query(""),
+    color_mode: str = Query(""),
+    work_type: str = Query(""),
+    language: str = Query(""),
 ):
-    """Filter by tags, rank by similarity."""
+    """Filter by tags, rank by similarity, with filters and pagination."""
     await _sync_vocabulary()
     terms = q.strip().split()
-    results = await state.engine.search_hybrid(
+    text, enums = _sim_filters(artist, series, rating, color_mode, work_type, language)
+    data = await state.engine.search_hybrid(
         tags=terms,
         similar_to=similar_to,
         embedding_type=embedding,
-        top_k=limit,
+        limit=limit,
+        offset=offset,
         collection=_collection(collection),
         copies=copies,
+        text=text,
+        enums=enums,
     )
     items = []
-    for r in results:
+    for r in data["results"]:
         item = await _work_to_item_resolved(r.work)
         items.append(SearchResultItem(work=item, score=r.score, matched_tags=r.matched_tags))
     if copies:
         await _attach_places(items)
-    return items
+    return {"results": items, "total": data["total"]}
 
 
 @router.get("/api/work", response_model=WorkItem | None)

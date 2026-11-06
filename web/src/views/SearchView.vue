@@ -399,16 +399,20 @@ async function searchSimilar() {
   loading.value = true
   error.value = ''
   try {
-    const c = f.collection.length
-      ? `&collection=${encodeURIComponent(f.collection.join(','))}` : ''
-    const url = similarMode.value === 'hybrid' && f.tags.length
-      ? `/api/hybrid?q=${encodeURIComponent(f.tags.join(' '))}&similar_to=${encodeURIComponent(similarRef.value)}&limit=60${c}${copiesFlag()}`
-      : `/api/similar?path=${encodeURIComponent(similarRef.value)}&limit=60${c}${copiesFlag()}`
-    const res = await fetch(url, { signal: freshSignal() })
+    const p = buildParams()
+    p.delete('q')
+    p.delete('exclude')
+    p.delete('sort')
+    p.delete('mode')
+    const base = similarMode.value === 'hybrid' && f.tags.length
+      ? `/api/hybrid?q=${encodeURIComponent(f.tags.join(' '))}&similar_to=${encodeURIComponent(similarRef.value)}`
+      : `/api/similar?path=${encodeURIComponent(similarRef.value)}`
+    const res = await fetch(`${base}&${p}${copiesFlag()}`, { signal: freshSignal() })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
     if (mine !== seq) return
-    results.value = data
-    total.value = 0
+    results.value = data.results || data
+    total.value = data.total ?? results.value.length
     facets.value = {}
   } catch (e) {
     if (mine === seq && e.name !== 'AbortError') error.value = `查詢失敗: ${e.message}`
@@ -1054,7 +1058,7 @@ onMounted(async () => {
       <main>
         <div class="resbar">
           <span v-if="loading">搜尋中…</span>
-          <span v-else-if="similarRef && results.length">最相似的 {{ results.length }} 本</span>
+          <span v-else-if="similarRef && total">相似結果 {{ total }} 筆</span>
           <span v-else>{{ total }} {{ view === 'copies' ? '組重複' : view === 'check' ? '項檢查結果' : '筆結果' }}<template v-if="totalPages > 1">，第 {{ page + 1 }} / {{ totalPages }} 頁</template></span>
         </div>
 

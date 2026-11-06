@@ -631,61 +631,97 @@ class SearchEngine:
                 """, *params, terms, slugs)
         return [{"value": r["value"], "count": r["count"]} for r in rows]
 
+    async def _sim_filter_where(self, conn, text, enums, _bind):
+        """Build WHERE fragments from the same text/enum filters faceted uses."""
+        conditions = []
+        enums = {k: [v for v in vs if v]
+                 for k, vs in (enums or {}).items() if k in self._ENUM_FIELDS and vs}
+        text = {k: v for k, v in (text or {}).items()
+                if v and k in self._TEXT_FIELDS}
+        for field, values in enums.items():
+            conditions.append(f"w.{field} = ANY({_bind(values)}::text[])")
+        for field, value in text.items():
+            like = f"%{value}%"
+            kind = self._MAPPED_FIELDS.get(field)
+            names = (await self._mapped_values(conn, kind, like)
+                     if kind else [])
+            if names:
+                conditions.append(
+                    f"(w.{field} ILIKE {_bind(like)}"
+                    f" OR lower(w.{field}) = ANY({_bind(names)}::text[]))")
+            else:
+                conditions.append(f"w.{field} ILIKE {_bind(like)}")
+        return conditions
+
     async def search_similar(
         self,
         reference_path: str | None = None,
         reference_embedding: list[float] | None = None,
         embedding_type: str = "style",
-        top_k: int = 10,
+        limit: int = 10,
+        offset: int = 0,
         collection: str | None = LEAD,
         copies: bool = False,
-    ) -> list[SearchResult]:
+        text: dict[str, str] | None = None,
+        enums: dict[str, list[str]] | None = None,
+    ) -> dict:
         """Find works similar to a reference work by embedding distance.
 
-        Args:
-            reference_path: Folder path of the reference work (looks up its embedding).
-            reference_embedding: Direct embedding vector (alternative to reference_path).
-            embedding_type: Which embedding to use ('style' or 'wd').
-            top_k: Number of results to return.
-            collection: Which collection the neighbours may come from.
-                Nearest-neighbour search ignores every filter it is not
-                given, so without this a look-alike from a collection the
-                user never browses would surface among the results.
-            copies: Only neighbours a second path repeats.
-
         Returns:
-            List of SearchResult sorted by similarity (highest first).
+            {"results": [SearchResult], "total": int}
         """
         collection = resolve_collection(collection)
         async with self.store.acquire() as conn:
 
             version = await profiles.embedding_version(conn)
             if version is None:
-                return []
+                return {"results": [], "total": 0}
             reference_id = None
             if reference_embedding is not None:
                 emb = np.array(reference_embedding, dtype=np.float32)
             elif reference_path:
                 found = await self._reference(conn, reference_path, version)
                 if found is None:
-                    return []
+                    return {"results": [], "total": 0}
                 reference_id, emb = found
             else:
-                return []
+                return {"results": [], "total": 0}
 
+            dim = len(emb)
+            dim_cond = f"vector_dims(v.vec) = {dim}"
+
+            params: list = [emb, reference_id, collection, copies, version]
+
+            def _bind(value) -> str:
+                params.append(value)
+                return f"${len(params)}"
+
+            extra = await self._sim_filter_where(conn, text, enums, _bind)
+            extra_sql = (" AND " + " AND ".join(extra)) if extra else ""
+
+            where = (f"{dim_cond}"
+                     f" AND w.id IS DISTINCT FROM $2"
+                     f" AND ($3::text[] IS NULL OR w.collection = ANY($3::text[]))"
+                     f" AND (NOT $4 OR {HAS_COPIES}){extra_sql}")
+
+            total = await conn.fetchval(f"""
+                SELECT COUNT(*) FROM works_effective w
+                JOIN derived.work_vectors v ON v.work_id = w.id
+                    AND v.model_version_id = $5
+                WHERE $1::vector IS NOT NULL AND {where}
+            """, *params)
+
+            lp = len(params) + 1
+            op = len(params) + 2
             rows = await conn.fetch(f"""
-                SELECT w.*, (v.vec <=> $1) AS distance
+                SELECT w.*, (v.vec <=> $1::vector) AS distance
                 FROM works_effective w
                 JOIN derived.work_vectors v ON v.work_id = w.id
-                                   AND v.model_version_id = $6
-                WHERE vector_dims(v.vec) = vector_dims($1)
-                    AND w.id IS DISTINCT FROM $3
-                    AND ($4::text[] IS NULL
-                         OR w.collection = ANY($4::text[]))
-                    AND (NOT $5 OR {HAS_COPIES})
-                ORDER BY v.vec <=> $1
-                LIMIT $2
-            """, emb, top_k, reference_id, collection, copies, version)
+                    AND v.model_version_id = $5
+                WHERE {where}
+                ORDER BY v.vec <=> $1::vector
+                LIMIT ${lp} OFFSET ${op}
+            """, *params, limit, offset)
 
             by_work = await tags_by_work(conn, (r["id"] for r in rows))
             results = []
@@ -694,7 +730,7 @@ class SearchEngine:
                 similarity = 1.0 - float(row["distance"])
                 results.append(SearchResult(work=work, score=similarity))
 
-            return results
+            return {"results": results, "total": total or 0}
 
     @staticmethod
     async def _reference(conn, path: str, version: int):
@@ -716,23 +752,17 @@ class SearchEngine:
         similar_to: str | None = None,
         similar_embedding: list[float] | None = None,
         embedding_type: str = "style",
-        top_k: int = 10,
+        limit: int = 10,
+        offset: int = 0,
         collection: str | None = LEAD,
         copies: bool = False,
-    ) -> list[SearchResult]:
-        """Filter by tags, then rank by similarity.
-
-        Args:
-            tags: Tag filters (same format as search_tags).
-            similar_to: Folder path of the reference work.
-            similar_embedding: Direct reference embedding.
-            embedding_type: Which embedding to use.
-            top_k: Number of results to return.
-            collection: Which collection to search; `None` for all.
-            copies: Only works a second path repeats.
+        text: dict[str, str] | None = None,
+        enums: dict[str, list[str]] | None = None,
+    ) -> dict:
+        """Filter by tags + metadata, rank by similarity.
 
         Returns:
-            List of SearchResult matching tags, ranked by similarity.
+            {"results": [SearchResult], "total": int}
         """
         collection = resolve_collection(collection)
         filters, content_tags = self._parse_query_terms(tags)
@@ -774,27 +804,48 @@ class SearchEngine:
                     )
                 """)
 
+            extra = await self._sim_filter_where(conn, text, enums, _bind)
+            conditions.extend(extra)
+
             where = " AND ".join(conditions)
 
             if emb is not None:
+                dim = len(emb)
                 emb_ph = _bind(emb)
+                ver_ph = _bind(version)
+                dim_cond = f"vector_dims(v.vec) = {dim}"
+                total = await conn.fetchval(f"""
+                    SELECT COUNT(*) FROM works_effective w
+                    JOIN derived.work_vectors v ON v.work_id = w.id
+                        AND v.model_version_id = {ver_ph}
+                    WHERE {where} AND {dim_cond}
+                """, *params)
+                page_params = list(params) + [limit, offset]
+                lp = len(params) + 1
+                op = len(params) + 2
                 rows = await conn.fetch(f"""
-                    SELECT w.*, (v.vec <=> {emb_ph}) AS distance
+                    SELECT w.*, (v.vec <=> {emb_ph}::vector) AS distance
                     FROM works_effective w
                     JOIN derived.work_vectors v ON v.work_id = w.id
-                                       AND v.model_version_id = {_bind(version)}
-                    WHERE {where} AND vector_dims(v.vec) = vector_dims({emb_ph})
-                    ORDER BY v.vec <=> {emb_ph}
-                    LIMIT {_bind(top_k)}
-                """, *params)
+                        AND v.model_version_id = {ver_ph}
+                    WHERE {where} AND {dim_cond}
+                    ORDER BY v.vec <=> {emb_ph}::vector
+                    LIMIT ${lp} OFFSET ${op}
+                """, *page_params)
             else:
+                total = await conn.fetchval(
+                    f"SELECT COUNT(*) FROM works_effective w WHERE {where}",
+                    *params)
+                page_params = list(params) + [limit, offset]
+                lp = len(params) + 1
+                op = len(params) + 2
                 rows = await conn.fetch(f"""
                     SELECT w.*, 0.0 as distance
                     FROM works_effective w
                     WHERE {where}
                     ORDER BY w.analyzed_at DESC{self.PAGING_TIEBREAK}
-                    LIMIT {_bind(top_k)}
-                """, *params)
+                    LIMIT ${lp} OFFSET ${op}
+                """, *page_params)
 
             by_work = await tags_by_work(conn, (r["id"] for r in rows))
             results = []
@@ -808,7 +859,7 @@ class SearchEngine:
                     matched_tags=matched,
                 ))
 
-            return results
+            return {"results": results, "total": total or 0}
 
     async def search_text(
         self,
