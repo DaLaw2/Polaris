@@ -83,35 +83,21 @@ class EntityManager:
             await self._load_term_map(conn)
 
     async def _build_tag_index(self, conn) -> None:
-        """Index every known tag by its Chinese name and spaced English name.
-
-        Ties go to the candidate with the highest document frequency in
-        this collection, so a query lands on a tag that is actually here.
-        """
-        rows = await conn.fetch(
-            "SELECT tag, COUNT(DISTINCT work_id) AS df FROM effective_tags "
-            "GROUP BY tag"
-        )
-        df = {r["tag"]: r["df"] for r in rows}
-
+        """Index every known tag by its Chinese name and spaced English name."""
         named = await conn.fetch(
             "SELECT tag AS canonical, display_zh FROM tag_translations")
 
         index: dict[str, str] = {}
-
-        def offer(term: str, tag: str) -> None:
-            key = term.strip().lower()
-            if not key or key == tag:
-                return
-            current = index.get(key)
-            if current is None or df.get(tag, 0) > df.get(current, 0):
-                index[key] = tag
-
         for r in named:
             tag_en = r["canonical"]
             if r["display_zh"]:
-                offer(r["display_zh"], tag_en)
-            offer(tag_en.replace("_", " "), tag_en)
+                key = r["display_zh"].strip().lower()
+                if key and key != tag_en:
+                    index.setdefault(key, tag_en)
+            spaced = tag_en.replace("_", " ")
+            key = spaced.strip().lower()
+            if key and key != tag_en:
+                index.setdefault(key, tag_en)
 
         self._term_to_tag = index
 

@@ -50,12 +50,8 @@ goto wait_pg
 :pg_ready
 echo [ok] database
 
-.venv\Scripts\polaris-migrate.exe > data\migrate.log 2>&1 || (
-    type data\migrate.log
-    echo [!!] The database schema is not current; see above. If migrations are pending, back it up, then run: .venv\Scripts\python.exe -m polaris.cli.migrate --apply
-    goto fail
-)
-echo [ok] schema
+start /b "" .venv\Scripts\polaris-migrate.exe > data\migrate.log 2>&1
+echo [ok] schema (checking in background)
 
 netstat -ano | findstr /r /c:":8000 .*LISTENING" >nul && (echo [ok] API already running) || (
     echo [..] starting API

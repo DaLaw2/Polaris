@@ -31,19 +31,13 @@ class Store:
         import asyncpg
         from pgvector.asyncpg import register_vector
 
-        bootstrap = await asyncpg.connect(self.dsn)
-        try:
-            await bootstrap.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        finally:
-            await bootstrap.close()
-
         self._pool = await asyncpg.create_pool(
-            self.dsn, min_size=2, max_size=10, init=register_vector,
+            self.dsn, min_size=1, max_size=10, init=register_vector,
             server_settings={"jit": "off"})
 
         async with self.acquire() as conn:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             await init_schema(conn)
-
             await check(conn)
 
     async def close(self) -> None:
