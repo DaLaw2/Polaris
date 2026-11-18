@@ -13,11 +13,14 @@ batch size.
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 
 from polaris import config
 
 CACHE_DIR = config.MODELS_DIR / "fp16"
+
+log = logging.getLogger(__name__)
 
 
 def cached_path(source: str | Path) -> Path:
@@ -49,9 +52,9 @@ def half_precision(source: str | Path) -> Path:
 
     try:
         model = _convert(source)
-    except Exception as e:
-        print(f"  [WARN] float16 conversion of {source.name} failed, "
-              f"using float32 ({e})")
+    except Exception:
+        log.exception("float16 conversion of %s failed, using float32",
+                      source.name)
         return source
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)

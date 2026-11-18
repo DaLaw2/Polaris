@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 from datetime import datetime
@@ -24,6 +25,10 @@ LEASE = f"{LEASE_S} seconds"
 BEAT_EVERY = 30.0
 SCANNER_KINDS = ("scan", "check", "build")
 DERIVE_POLL_S = 2.0
+STALL = "600 seconds"
+LOCK_KEY = 0x706F6C61
+
+log = logging.getLogger(__name__)
 
 JOB_COLUMNS = (
     "id, collection, path, state, total, done, current_path, "
@@ -67,6 +72,7 @@ _CLAIM = """
 UPDATE scan_jobs SET
     state = 'running',
     heartbeat_at = NOW(),
+    progress_at = NOW(),
     worker_id = $1
 WHERE id = (
     SELECT id FROM scan_jobs
@@ -107,14 +113,17 @@ async def beat(conn, job_id: int, done: int | None = None,
 
     The worker's own row is renewed in the same statement. `seen` is the
     only other writer of it and it runs between jobs, so a worker in the
-    middle of a long scan used to go quiet for as long as the scan took --
-    a two-hour job left it reading as failed for two hours, which is what
-    the roster shows and what `forget` deletes.
+    middle of a long scan would otherwise go quiet for as long as the scan
+    took. A beat with nothing to report renews the lease but not
+    `progress_at`, which is what the roster's `stalled` reads.
     """
     row = await conn.fetchrow("""
         WITH j AS (
             UPDATE scan_jobs SET
                 heartbeat_at = NOW(),
+                progress_at = CASE WHEN $2::int IS NULL AND $3::int IS NULL
+                                        AND $4::text IS NULL
+                                   THEN progress_at ELSE NOW() END,
                 done = COALESCE($2, done),
                 total = COALESCE($3, total),
                 current_path = COALESCE($4, current_path)
@@ -130,6 +139,16 @@ async def beat(conn, job_id: int, done: int | None = None,
         FROM j""",
         job_id, done, total, current_path)
     return bool(row and row["stop"])
+
+
+async def offload(conn, job_id: int, fn, *args):
+    """`fn` on a thread, renewing the job's lease while it runs."""
+    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    while not task.done():
+        await asyncio.wait({task}, timeout=BEAT_EVERY)
+        if not task.done():
+            await beat(conn, job_id)
+    return task.result()
 
 
 async def release(conn, job_id: int, state: str, error: str | None = None,
@@ -233,19 +252,48 @@ async def serve_derive(store, who: str | None = None) -> None:
                     continue
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            print(f"derive loop: {type(e).__name__}: {e}", flush=True)
+        except Exception:
+            log.exception("derive loop")
         await asyncio.sleep(DERIVE_POLL_S)
+
+
+_LIVE = f"""
+SELECT a.application_name AS id, a.backend_start
+FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE l.locktype = 'advisory' AND l.granted
+  AND l.classid = 0 AND l.objid = {LOCK_KEY} AND l.objsubid = 1
+  AND l.database = (SELECT oid FROM pg_database
+                    WHERE datname = current_database())
+"""
+
+
+async def hold(dsn: str, who: str):
+    """The connection that makes this process the worker, or None when
+    another process already is.
+
+    An advisory lock lives as long as its connection, so a worker that
+    dies however it dies lets go, and its `application_name` is how the
+    roster names it. A connection of its own, since a pooled one is reset
+    -- advisory locks included -- every time it goes back to the pool.
+    """
+    import asyncpg
+
+    conn = await asyncpg.connect(
+        dsn, server_settings={"application_name": who})
+    if await conn.fetchval("SELECT pg_try_advisory_lock($1)", LOCK_KEY):
+        return conn
+    await conn.close()
+    return None
 
 
 async def register(conn, who: str) -> None:
     """Say that this process is here and willing.
 
-    Keyed on host:pid, so a worker restarting into a recycled pid takes
-    over its own row rather than adding a second one, and `stop_requested`
-    is cleared -- a stop applies to the process that was asked, not to
-    whatever starts next.
+    Called holding the lock, so any other row is a worker that died
+    without leaving, and goes. `stop_requested` is cleared: a stop applies
+    to the process that was asked, not to whatever starts next.
     """
+    await conn.execute("DELETE FROM scan_workers WHERE id <> $1", who)
     await conn.execute("""
         INSERT INTO scan_workers (id) VALUES ($1)
         ON CONFLICT (id) DO UPDATE SET
@@ -272,50 +320,33 @@ async def retire(conn, who: str) -> None:
 
 
 async def request_stop(conn, who: str | None = None) -> int:
-    """Ask a worker to finish and leave. None asks all of them."""
+    """Ask the worker to finish and leave. None asks whichever is there."""
     rows = await conn.fetch(
         "UPDATE scan_workers SET stop_requested = TRUE "
         "WHERE ($1::text IS NULL OR id = $1) AND NOT stop_requested "
+        f"AND id IN (SELECT id FROM ({_LIVE}) l) "
         "RETURNING id", who)
     return len(rows)
 
 
-async def forget(conn, who: str | None = None, lease: str = LEASE) -> int:
-    """Drop the rows of workers that stopped answering. None drops all.
+async def roster(conn, stall: str = STALL) -> list:
+    """The worker holding the lock, if any, and what it is doing.
 
-    A worker deletes its own row on the way out, so a row that outlives its
-    lease belongs to one that did not get to: killed, crashed, or the
-    machine went down. Nothing else removes it, and the roster is what the
-    page reads, so the ghosts accumulate there until somebody says so.
-
-    Guarded by the lease rather than taking the caller's word: a live
-    worker's row is what stops a second one starting, and deleting it would
-    make the page offer to start one that is already there.
+    Alive is the lock and nothing else. `stalled` is a running job that
+    has renewed its lease but reported no progress for `stall`.
     """
-    rows = await conn.fetch(
-        "DELETE FROM scan_workers "
-        "WHERE ($1::text IS NULL OR id = $1) "
-        "  AND heartbeat_at < NOW() - $2::text::interval "
-        "RETURNING id", who, lease)
-    return len(rows)
-
-
-async def roster(conn, lease: str = LEASE) -> list:
-    """Every worker on record, and what each is doing.
-
-    `stale` is the same judgement `claim` makes when it takes a job away
-    from a silent worker, so a reader is told what the queue already
-    believes rather than being handed a timestamp to interpret.
-    """
-    return list(await conn.fetch("""
-        SELECT w.id, w.started_at, w.heartbeat_at, w.models_loaded,
-               w.stop_requested,
-               w.heartbeat_at < NOW() - $1::text::interval AS stale,
-               j.id AS job_id
-        FROM scan_workers w
-        LEFT JOIN scan_jobs j
-               ON j.worker_id = w.id AND j.state = 'running'
-        ORDER BY w.started_at""", lease))
+    return list(await conn.fetch(f"""
+        SELECT l.id, substring(l.id from '[0-9]+$')::int AS pid,
+               l.backend_start AS started_at,
+               COALESCE(w.models_loaded, FALSE) AS models_loaded,
+               COALESCE(w.stop_requested, FALSE) AS stop_requested,
+               j.id AS job_id,
+               COALESCE(j.progress_at < NOW() - $1::text::interval, FALSE)
+                   AS stalled
+        FROM ({_LIVE}) l
+        LEFT JOIN scan_workers w ON w.id = l.id
+        LEFT JOIN scan_jobs j ON j.worker_id = l.id AND j.state = 'running'
+        ORDER BY l.backend_start""", stall))
 
 
 JobBody = Callable[[Any, Any], Awaitable[int | None]]
@@ -333,6 +364,7 @@ async def run_job(conn, job, body: JobBody) -> str:
         await release(conn, job["id"], "cancelled", "worker stopped")
         raise
     except Exception as e:
+        log.exception("%s job %s failed", job["kind"], job["id"])
         await release(conn, job["id"], "failed", f"{type(e).__name__}: {e}")
         return "failed"
 

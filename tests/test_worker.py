@@ -1,5 +1,6 @@
 """The claim loop and the roster: POLARIS_TEST_DSN=postgresql://.../polaris_test python tests/test_worker.py"""
 import asyncio
+import time
 
 from _common import dsn
 
@@ -74,24 +75,33 @@ async def roster(conn, p):
     A, B = "worker-test:1", "worker-test:2"
     assert worker.LEASE == f"{worker.LEASE_S} seconds" and worker.BEAT_EVERY * 2 < worker.LEASE_S
     job = await worker.enqueue(conn, path="/nowhere", model_profile_id=p)
-    assert await worker.roster(conn) == [], "a queued job invented a worker"
+    await worker.register(conn, "ghost:9")
+    assert await worker.roster(conn) == [], "a row without the lock is a worker"
+    assert await worker.request_stop(conn, None) == 0, "a ghost was asked to stop"
+    lock = await worker.hold(DSN, A)
+    assert lock is not None and await worker.hold(DSN, B) is None, "two workers held the lock"
     await worker.register(conn, A)
+    assert await conn.fetchval("SELECT count(*) FROM scan_workers") == 1, "the ghost survived"
     row = (await worker.roster(conn))[0]
-    assert (row["stale"], row["job_id"], row["models_loaded"]) == (False, None, False)
+    assert (row["id"], row["pid"], row["job_id"], row["models_loaded"], row["stalled"]) ==         (A, 1, None, False, False)
     assert (await worker.claim(conn, A))["id"] == job
     await worker.seen(conn, A, models_loaded=True)
     row = (await worker.roster(conn))[0]
     assert row["job_id"] == job and row["models_loaded"] is True
-    print("  ok  no worker is no row; a worker names its job and admits to the models")
+    print("  ok  only the lock holder is a worker; a second cannot hold it; ghosts go on register")
 
-    await conn.execute("UPDATE scan_workers SET heartbeat_at = NOW() - $1::text::interval "
-                       "WHERE id = $2", f"{worker.LEASE_S * 2} seconds", A)
-    assert (await worker.roster(conn))[0]["stale"] is True
+    old = await conn.fetchrow("SELECT heartbeat_at, progress_at FROM scan_jobs WHERE id = $1", job)
+    every, worker.BEAT_EVERY = worker.BEAT_EVERY, 0.2
+    try:
+        assert await worker.offload(conn, job, lambda: time.sleep(1.0) or 7) == 7
+    finally:
+        worker.BEAT_EVERY = every
+    new = await conn.fetchrow("SELECT heartbeat_at, progress_at FROM scan_jobs WHERE id = $1", job)
+    assert new["heartbeat_at"] > old["heartbeat_at"] and new["progress_at"] == old["progress_at"]
+    assert (await worker.roster(conn, stall="0.5 seconds"))[0]["stalled"] is True
     await worker.beat(conn, job, done=1)
-    assert (await worker.roster(conn))[0]["stale"] is False, "a beat left the worker stale"
-    await worker.register(conn, A)
-    assert len(await worker.roster(conn)) == 1, "re-registering added a worker"
-    print(f"  ok  past the {worker.LEASE_S}s lease reads stale; a beat or re-register revives it")
+    assert (await worker.roster(conn, stall="0.5 seconds"))[0]["stalled"] is False
+    print("  ok  a blocking call on a thread renews the lease; only progress clears stalled")
 
     assert await worker.request_stop(conn, A) == 1 and await worker.request_stop(conn, A) == 0
     assert await worker.seen(conn, A) is True
@@ -102,13 +112,14 @@ async def roster(conn, p):
     assert await worker.beat(conn, job, done=3) is True
     print("  ok  a stop reaches the worker idle and mid-job; cancelling a job is not a stop")
 
-    await worker.register(conn, B)
-    assert await worker.request_stop(conn, None) == 2
-    assert all(r["stop_requested"] for r in await worker.roster(conn))
+    await lock.close()
+    assert await worker.roster(conn) == [] and await worker.request_stop(conn, None) == 0
+    lock = await worker.hold(DSN, B)
+    assert lock is not None and [r["id"] for r in await worker.roster(conn)] == [B]
     await worker.retire(conn, A)
-    await worker.retire(conn, B)
+    await lock.close()
     assert await worker.roster(conn) == []
-    print("  ok  stopping everything asks every worker; a worker that left leaves no row")
+    print("  ok  a closed connection is a worker gone at once, and the next one can hold it")
 
 
 async def main():

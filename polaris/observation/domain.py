@@ -77,6 +77,7 @@ class WorkObservation:
     measurements: list["Measurement"] = field(default_factory=list)
     embeddings: dict = field(default_factory=dict)
     error: Optional[str] = None
+    backend_errors: dict = field(default_factory=dict)
 
     @property
     def analyzed_samples(self) -> list["Sample"]:

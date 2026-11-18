@@ -18,7 +18,7 @@ export function providePoll({ gpu = () => false, onFinish = () => {} } = {}) {
 
   const busy = () =>
     !!state.overview?.jobs.some(j => j.state === 'running') ||
-    !!state.worker?.workers.some(w => !w.stale && (w.job_id || state.overview?.jobs.length))
+    !!state.worker?.workers.some(w => w.job_id || state.overview?.jobs.length)
 
   function schedule() {
     clearTimeout(timer)
@@ -71,10 +71,9 @@ export function scannerState(poll) {
   if (!poll.reachable) return { tone: 'bad', text: '無法連線後端' }
   const w = poll.worker
   if (!w) return { tone: '', text: '載入中' }
-  const live = w.workers.filter(x => !x.stale)
-  if (live.some(x => x.job_id)) return { tone: 'go live', text: '執行中' }
-  if (live.length) return { tone: 'go', text: '閒置' }
-  if (w.workers.length) return { tone: 'warn', text: '無回應' }
+  if (w.workers.some(x => x.stalled)) return { tone: 'warn', text: '無進展' }
+  if (w.workers.some(x => x.job_id)) return { tone: 'go live', text: '執行中' }
+  if (w.workers.length) return { tone: 'go', text: '閒置' }
   return { tone: '', text: '未啟動' }
 }
 

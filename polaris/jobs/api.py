@@ -42,13 +42,7 @@ WORKER_LOG = config.PROJECT_ROOT / "data" / "scan_worker.log"
 
 @router.get("/api/scan/worker")
 async def scan_worker_status():
-    """Who is willing to take a job, and whether they are still talking.
-
-    `stale` is the same judgement the claim statement makes when it takes
-    a job away from a silent worker, so a reader is told what the queue
-    already believes. A stale worker's `models_loaded` is its last word,
-    not a fact about the card now, and the page says so rather than
-    repeating it.
+    """The worker holding the lock, if one is, and what it is doing.
 
     `queued` counts what waits for a scan worker; `by_kind` counts every
     kind, derive included, queued and running.
@@ -71,7 +65,7 @@ WORKER_START_TIMEOUT_S = 30.0
 
 
 @router.post("/api/scan/worker")
-async def start_scan_worker(force: bool = Query(False)):
+async def start_scan_worker():
     """Start a worker process, detached, and wait until it says it is up.
 
     Detached on purpose: restarting the API must not take a scan with it,
@@ -89,9 +83,8 @@ async def start_scan_worker(force: bool = Query(False)):
     "did it start" rather than "was it launched".
     """
     async with state.store.acquire() as conn:
-        before = {w["id"] for w in await worker.roster(conn)}
-        live = [w for w in await worker.roster(conn) if not w["stale"]]
-    if live and not force:
+        live = await worker.roster(conn)
+    if live:
         raise refuse(409, "worker_running", f"{live[0]['id']} is already here",
                      worker=live[0]["id"])
 
@@ -99,8 +92,7 @@ async def start_scan_worker(force: bool = Query(False)):
     detach = ({"creationflags": subprocess.CREATE_NO_WINDOW
                                 | subprocess.CREATE_NEW_PROCESS_GROUP}
               if sys.platform == "win32" else {"start_new_session": True})
-    argv = ([sys.executable, "-u", "-m", "polaris.cli.scan_worker"]
-            + (["--force"] if force else []))
+    argv = [sys.executable, "-u", "-m", "polaris.cli.scan_worker"]
     with open(WORKER_LOG, "ab") as log:
         subprocess.Popen(
             argv, cwd=str(config.PROJECT_ROOT), stdin=subprocess.DEVNULL,
@@ -110,8 +102,7 @@ async def start_scan_worker(force: bool = Query(False)):
     while time.monotonic() < deadline:
         await asyncio.sleep(0.5)
         async with state.store.acquire() as conn:
-            new = [w for w in await worker.roster(conn)
-                   if w["id"] not in before]
+            new = await worker.roster(conn)
         if new:
             return {"worker": dict(new[0]), "log": str(WORKER_LOG)}
 
@@ -121,21 +112,14 @@ async def start_scan_worker(force: bool = Query(False)):
 
 
 @router.delete("/api/scan/worker")
-async def stop_scan_worker(id: str | None = Query(None),
-                           forget: bool = Query(False)):
-    """Ask a worker to finish and leave. No id asks all of them.
+async def stop_scan_worker(id: str | None = Query(None)):
+    """Ask the worker to finish and leave. No id asks whichever is there.
 
     Asks; does not kill. A worker in the middle of a work finishes writing
     it and stops at the next one, which is the same bargain `cancel` makes
     with a job.
-
-    `forget` is the other case: a worker that is already gone and left its
-    row behind cannot be asked anything, and the row is what the page shows
-    as a process that exists. It only ever removes a row past its lease.
     """
     async with state.store.acquire() as conn:
-        if forget:
-            return {"forgotten": await worker.forget(conn, id)}
         asked = await worker.request_stop(conn, id)
     return {"asked": asked}
 

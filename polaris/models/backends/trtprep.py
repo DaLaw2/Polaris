@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import logging
 import os
 from pathlib import Path
 
@@ -57,6 +58,8 @@ _DISABLED = ("MatMulScaleFusion;QuickGeluFusion;BiasGeluFusion;"
 _OPSET = 17
 
 _PROTO_LIMIT = 2 ** 31 - 2 ** 24
+
+log = logging.getLogger(__name__)
 
 
 _in_use = False
@@ -141,9 +144,9 @@ def trt_graph(source: str | Path) -> Path | None:
     staged = CACHE_DIR / f"{source.stem}.staged.onnx"
     try:
         model = _convert(source, staged)
-    except Exception as e:
-        print(f"  [WARN] TensorRT conversion of {source.name} failed, "
-              f"scoring on CUDA instead ({e})")
+    except Exception:
+        log.exception("TensorRT conversion of %s failed, scoring on CUDA "
+                      "instead", source.name)
         return None
     finally:
         for leftover in CACHE_DIR.glob(staged.name.split(".onnx")[0] + "*"):

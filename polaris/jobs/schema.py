@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
     requested_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at      TIMESTAMPTZ,
     heartbeat_at     TIMESTAMPTZ,
+    progress_at      TIMESTAMPTZ,
     worker_id        TEXT,
     cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
     current_path     TEXT,

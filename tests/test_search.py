@@ -84,11 +84,14 @@ async def main():
         assert {f["value"] for f in out["facets"]["character"]} == {"st-hero"}
         print("  ok  faceted search filters, excludes and counts facets")
 
-        near = await call(api.similar, path=a, collection=COLL)
+        out = await call(api.similar, path=a, collection=COLL)
+        near = out["results"]
         assert names(near) == ["b", "c"] and near[0].score > near[1].score, near
-        assert await call(api.similar, path="/nowhere", collection=COLL) == []
-        mixed = await call(api.hybrid, q="st-blue", similar_to=a, collection=COLL)
-        assert names(mixed) == ["b", "c"], names(mixed)
+        assert out["total"] == 2, out["total"]
+        assert await call(api.similar, path="/nowhere", collection=COLL) == {
+            "results": [], "total": 0}
+        out = await call(api.hybrid, q="st-blue", similar_to=a, collection=COLL)
+        assert names(out["results"]) == ["b", "c"] and out["total"] == 2, out
         print("  ok  similar ranks by vector without the reference; hybrid filters then ranks")
 
         work = await api.get_work(path=a)
@@ -97,11 +100,10 @@ async def main():
         assert await api.get_work(path="/nowhere") is None
         assert (await api.stats())["total_works"] == before + 3
         print("  ok  one work reads whole, a missing one is null, stats count it")
-
-        async with state.store.acquire() as conn:
-            await clean(conn)
         print("all search checks passed")
     finally:
+        async with state.store.acquire() as conn:
+            await clean(conn)
         await state.store.close()
 
 

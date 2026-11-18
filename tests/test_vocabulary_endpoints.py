@@ -26,7 +26,10 @@ SLUG, TERM = "vt-term-artist", "VT Term Artist"
 
 async def clean(conn):
     ids = [r["id"] for r in await conn.fetch(
-        "SELECT id FROM works WHERE content_key LIKE 'vt-test:%'")]
+        "SELECT id FROM works WHERE content_key LIKE 'vt-test:%' UNION "
+        "SELECT t.work_id FROM work_tags t LEFT JOIN term_map tm "
+        "ON lower(tm.term) = lower(t.tag) WHERE tm.id IS NULL "
+        "AND t.category = 'character' AND t.tag NOT LIKE 'vt-%'")]
     await conn.execute("DELETE FROM work_claims WHERE work_id = ANY($1::int[])", ids)
     await conn.execute("DELETE FROM works WHERE id = ANY($1::int[])", ids)
     await conn.execute("DELETE FROM scan_runs WHERE params @> $1::jsonb", json.dumps(TAG))

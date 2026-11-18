@@ -811,7 +811,6 @@ class SearchEngine:
 
             if emb is not None:
                 dim = len(emb)
-                emb_ph = _bind(emb)
                 ver_ph = _bind(version)
                 dim_cond = f"vector_dims(v.vec) = {dim}"
                 total = await conn.fetchval(f"""
@@ -820,6 +819,7 @@ class SearchEngine:
                         AND v.model_version_id = {ver_ph}
                     WHERE {where} AND {dim_cond}
                 """, *params)
+                emb_ph = _bind(emb)
                 page_params = list(params) + [limit, offset]
                 lp = len(params) + 1
                 op = len(params) + 2

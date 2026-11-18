@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -22,6 +23,8 @@ from polaris.models import profiles
 
 from . import calibration, ingest
 from .domain import Sample
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -133,7 +136,7 @@ async def _note_error(conn, run_id, path, stage, message) -> None:
         await ingest.record_error(conn, run_id, _storable(path), stage,
                                   _storable(message))
     except Exception:
-        pass
+        log.exception("could not record %s error for %s", stage, path)
 
 
 async def curated_keep_tags(conn) -> frozenset[str]:
@@ -151,10 +154,20 @@ async def _plan(conn, targets: list[Path], loaded: dict[str, int],
     rows = {r["path"]: r for r in await conn.fetch(
         """
         SELECT p.path, w.id, w.content_key,
-               ARRAY(SELECT DISTINCT ss.model_version_id
+               ARRAY(SELECT ss.model_version_id
                      FROM work_samples s
                      JOIN sample_scores ss ON ss.sample_id = s.id
-                     WHERE s.work_id = w.id) AS scored
+                     WHERE s.work_id = w.id AND s.analyzed
+                       AND s.run_id = (SELECT MAX(run_id) FROM work_samples
+                                       WHERE work_id = w.id)
+                     GROUP BY ss.model_version_id
+                     HAVING COUNT(*) = (
+                         SELECT COUNT(*) FROM work_samples x
+                         WHERE x.work_id = w.id AND x.analyzed
+                           AND x.run_id = (SELECT MAX(run_id)
+                                           FROM work_samples
+                                           WHERE work_id = w.id)))
+                   AS scored
         FROM work_paths p JOIN works w ON w.id = p.work_id
         WHERE p.present AND p.path = ANY($1::text[])
         """, [str(t) for t in targets])}
@@ -326,7 +339,8 @@ async def execute(
         todo = [t for t in planned if t.plan is not None]
         observed = pipeline.observe_batch([t.plan for t in todo],
                                           n_samples=None, show_progress=False)
-        for t, obs in zip(todo, observed):
+        for t in todo:
+            obs = await worker.offload(conn, job_id, next, observed)
             if obs.error:
                 out.errors += 1
                 await _note_error(conn, await run(), obs.path,
@@ -344,7 +358,17 @@ async def execute(
                         out.rescored += 1
                     status = (f"{len(obs.analyzed_samples)} samples, "
                               f"{'all models' if t.plan.only is None else ', '.join(sorted(t.plan.only))}")
+                    for name, why in obs.backend_errors.items():
+                        await _note_error(conn, await run(), obs.path,
+                                          "tagging", f"{name}: {why}")
+                    lost = len(obs.samples) - len(obs.analyzed_samples)
+                    if t.plan.samples is not None and lost:
+                        await _note_error(
+                            conn, await run(), obs.path, "sampling",
+                            f"{lost} of {len(obs.samples)} recorded samples "
+                            f"no longer decode")
                 except Exception as e:
+                    log.exception("writing %s failed", obs.path)
                     out.errors += 1
                     await _note_error(conn, await run(), obs.path, "write",
                                       str(e))

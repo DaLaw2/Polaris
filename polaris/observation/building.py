@@ -155,6 +155,7 @@ async def _build(conn, job_id: int, vid: int, d: definition.Definition,
     await conn.execute(
         "UPDATE model_versions SET state = 'ready', embedding_dim = $2, "
         "drift = $3, error = NULL WHERE id = $1", vid, dim, drift)
+    await worker.beat(conn, job_id, done=len(STEPS))
     note(f"build {d.name} {precision}: ready"
          + ("" if drift is None else f", drift {drift:.2%}"))
 

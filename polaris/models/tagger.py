@@ -8,12 +8,16 @@ Adding a model is one uploaded definition; nothing here
 changes.
 """
 
+import logging
+
 from PIL import Image
 
 from polaris.models.backends.base import (
     BackendConfig, ImageViews, SampleScores)
 
 RAW_TOP_K = 300
+
+log = logging.getLogger(__name__)
 
 
 class Tagger:
@@ -62,6 +66,7 @@ class Tagger:
         per_backend: dict[str, list],
         top_k: int = RAW_TOP_K,
         keep: frozenset[str] = frozenset(),
+        failed: dict[str, str] | None = None,
     ) -> dict[str, list[SampleScores]]:
         """Each backend's rows for its own list of prepared images.
 
@@ -70,20 +75,23 @@ class Tagger:
         stored and which wins is decided at read time. The lists are not
         assumed to describe the same images in the same order: a backend
         that was given fewer of them gets fewer rows back, and the caller
-        keeps the correspondence.
+        keeps the correspondence. A backend that fails is left out, and
+        named in `failed` with why.
         """
         if not any(per_backend.values()):
             return {}
-        return self._run_backends(per_backend, top_k, keep)
+        return self._run_backends(per_backend, top_k, keep,
+                                  {} if failed is None else failed)
 
     def _run_backends(
         self,
         prepared: dict[str, list],
         top_k: int,
         keep: frozenset[str],
+        failed: dict[str, str],
     ) -> dict[str, list[SampleScores]]:
         """One run of every backend over its own images, keyed by name. A
-        backend that fails is left out."""
+        backend that fails is left out and named in `failed`."""
         self.ensure_loaded()
 
         per_backend: dict[str, list[SampleScores]] = {}
@@ -104,12 +112,14 @@ class Tagger:
                     try:
                         per_backend[name] = fut.result()
                     except Exception as e:
-                        print(f"  [WARN] {name} scoring failed: {e}")
+                        log.exception("%s scoring failed", name)
+                        failed[name] = str(e)
 
         for cfg in sequential:
             try:
                 per_backend[cfg.backend.name] = _run(cfg)
             except Exception as e:
-                print(f"  [WARN] {cfg.backend.name} scoring failed: {e}")
+                log.exception("%s scoring failed", cfg.backend.name)
+                failed[cfg.backend.name] = str(e)
 
         return per_backend

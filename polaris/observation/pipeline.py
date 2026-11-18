@@ -16,6 +16,7 @@ Speed and size:
   than a 30-second one
 """
 
+import logging
 import os
 import threading
 import time
@@ -39,6 +40,8 @@ DECODE_WORKERS = min(6, os.cpu_count() or 1)
 PREPARED_FRAMES = 192
 
 SCORE_FRAMES = 96
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -234,6 +237,7 @@ class Pipeline:
                 kept += 1
                 del img
         except BaseException as e:
+            log.exception("sampling %s failed", target)
             error = f"sampling: {e}"
             if st.obs is None:
                 st.obs = WorkObservation(
@@ -263,6 +267,7 @@ class Pipeline:
             try:
                 self._score_frames(batch)
             except BaseException as e:
+                log.exception("scoring a batch failed")
                 for st, ordinal, _ in batch:
                     if st.obs is not None and not st.obs.error:
                         st.obs.error = f"tagging: {e}"
@@ -284,11 +289,17 @@ class Pipeline:
                 owner.setdefault(name, []).append((st, ordinal))
 
         error = None
+        failed: dict[str, str] = {}
         try:
             rows = self.tagger.score_flat(
-                flat, top_k=self.raw_top_k, keep=self.keep_tags)
+                flat, top_k=self.raw_top_k, keep=self.keep_tags, failed=failed)
         except Exception as e:
+            log.exception("scoring a batch failed")
             rows, error = {}, f"tagging: {e}"
+        for name, why in failed.items():
+            for st, _ in owner.get(name, ()):
+                if st.obs is not None:
+                    st.obs.backend_errors.setdefault(name, why)
 
         got: dict[int, tuple] = {}
         for st, ordinal, _ in batch:
@@ -309,7 +320,9 @@ class Pipeline:
         obs.scores = [st.rows.get(s.ordinal, {}) for s in obs.analyzed_samples]
         if obs.scores and not obs.error and not any(
                 seen.scores for per in obs.scores for seen in per.values()):
-            obs.error = "tagging: every backend returned no scores"
+            obs.error = "tagging: " + ("; ".join(
+                f"{n}: {why}" for n, why in obs.backend_errors.items())
+                or "every backend returned no scores")
         obs.embeddings = self._mean_embeddings(obs.scores)
         st.rows.clear()
         return obs

@@ -6,6 +6,7 @@ the float16 copy `halfprec` makes; TensorRT gets the fused graph
 different numbers and each is only right for its own backend.
 """
 
+import logging
 import os
 
 from onnxruntime import (
@@ -16,6 +17,8 @@ from onnxruntime import (
 )
 
 from . import halfprec, trtprep
+
+log = logging.getLogger(__name__)
 
 
 def _cuda_provider() -> str:
@@ -60,6 +63,9 @@ def open_onnx_model(path: str, provider: str | None = None,
                                        providers=trtprep.providers(graph))
             if session.get_providers()[0] == trtprep.PROVIDER:
                 trtprep.mark_in_use()
+            else:
+                log.warning("%s opened on %s, not TensorRT", graph,
+                            session.get_providers()[0])
             return session
         chosen = _cuda_provider()
 
@@ -72,4 +78,8 @@ def open_onnx_model(path: str, provider: str | None = None,
     if "CPUExecutionProvider" not in providers:
         providers.append("CPUExecutionProvider")
 
-    return InferenceSession(str(path), options, providers=providers)
+    session = InferenceSession(str(path), options, providers=providers)
+    if session.get_providers()[0] != chosen:
+        log.warning("%s opened on %s, not %s", path,
+                    session.get_providers()[0], chosen)
+    return session

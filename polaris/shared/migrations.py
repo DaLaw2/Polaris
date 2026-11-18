@@ -47,6 +47,17 @@ MIGRATIONS: tuple[Migration, ...] = (
         counts="SELECT 0",
         sql="",
     ),
+    Migration(
+        version="0002",
+        note="scan_jobs.progress_at: when a running job last moved, apart "
+             "from the lease its heartbeat renews.",
+        settled="SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'scan_jobs' "
+                "AND column_name = 'progress_at')",
+        counts="SELECT 0",
+        sql="ALTER TABLE scan_jobs ADD COLUMN IF NOT EXISTS "
+            "progress_at TIMESTAMPTZ",
+    ),
 )
 
 

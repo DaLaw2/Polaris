@@ -169,14 +169,22 @@ async def check_explain(conn, fake, fake2, e):
     print("  ok  explain matches what the derivation kept, source by source")
 
 
-async def check_coverage(conn, pid):
+async def coverage(pid):
+    return {(m["backend"], side): m[side]["scored"]
+            for m in (await models_api.profile_coverage(pid))["members"]
+            for side in ("searchable", "other")}
+
+
+async def check_coverage(conn, pid, before):
     got = {m["backend"]: m for m in (await models_api.profile_coverage(pid))["members"]}
-    fake, fake2 = got["fake"], got["fake2"]
+    fake = got["fake"]
     assert fake["searchable"]["works"] == await conn.fetchval(
         "SELECT COUNT(*) FROM work_paths p JOIN collections c "
         "ON c.name = p.collection WHERE p.present AND c.searchable"), fake
-    assert fake["searchable"]["scored"] == fake2["searchable"]["scored"] + 2
-    assert fake["other"]["scored"] - fake2["other"]["scored"] == 1 and fake["other"]["works"] >= 1
+    delta = {k: v - before.get(k, 0) for k, v in (await coverage(pid)).items()}
+    assert delta == {("fake", "searchable"): 3, ("fake2", "searchable"): 1,
+                     ("fake", "other"): 1, ("fake2", "other"): 0}, delta
+    assert fake["other"]["works"] >= 1
     await refused(models_api.profile_coverage(-1), 404, "profile_not_found")
     print("  ok  coverage splits searchable collections from the rest")
 
@@ -221,6 +229,7 @@ async def main():
             fake = await member(conn, "fake", ["general", "character", "copyright", "rating"])
             fake2 = await member(conn, "fake2", ["general"], yields=True)
             pid = await profiles.active_profile(conn)
+            before = await coverage(pid)
             series = await terms.concept(conn, "series", "wt-series")
             await terms.map_term(conn, "wt-char", await terms.concept(
                 conn, "character", "wt-char", parent_id=series))
@@ -238,11 +247,12 @@ async def main():
         await check_list(a, b, e, series)
         async with state.store.acquire() as conn:
             await check_explain(conn, fake, fake2, e)
-            await check_coverage(conn, pid)
+            await check_coverage(conn, pid, before)
             await check_overview(conn, pid, a)
-            await clean(conn)
         print("all works endpoint checks passed")
     finally:
+        async with state.store.acquire() as conn:
+            await clean(conn)
         await state.store.close()
 
 

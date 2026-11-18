@@ -24,6 +24,7 @@ COLL = "scan-job-test"
 COLLS = ("scanning-a", "scanning-b")
 NAMES = ("fake", "fake2")
 prepared: dict[str, int] = {}
+failing: set[str] = set()
 
 
 class FakeBackend:
@@ -43,6 +44,8 @@ class FakeBackend:
         return views_of(image).rgb().size
 
     def score_prepared(self, batch, top_k=0, keep=frozenset()):
+        if self.name in failing:
+            raise RuntimeError(f"{self.name} exploded")
         return [SampleScores([RawScore("general", f"{self.name}_tag", 0.9)],
                              embedding=[1.0, 0.0, 0.0, 0.0]) for _ in batch]
 
@@ -222,6 +225,38 @@ async def test_jobs(conn, root: Path):
     await conn.execute("UPDATE model_versions SET revision = NULL, state = 'ready' "
                        "WHERE id = $1", versions["fake"])
     print("  ok  a version that is not ready, or loads at another revision, fails the job")
+
+    await conn.execute("DELETE FROM scan_errors")
+    failing.add("fake2")
+    try:
+        state, job = await run(conn, pid, "t10", paths=[str(work(root, "three"))])
+    finally:
+        failing.clear()
+    errors = [dict(e) for e in await conn.fetch("SELECT stage, message FROM scan_errors")]
+    assert state == "done" and errors == [{"stage": "tagging",
+                                           "message": "fake2: fake2 exploded"}], (state, errors)
+    assert await count(conn, "sample_scores ss JOIN work_samples s ON s.id = ss.sample_id "
+                       "JOIN work_paths p ON p.work_id = s.work_id WHERE p.path = $1 "
+                       "AND ss.model_version_id = $2", str(root / "three"), versions["fake"]) == 2
+    print("  ok  a backend that fails is recorded in scan_errors, the others' scores are kept")
+
+    scored = ("sample_scores ss JOIN work_samples s ON s.id = ss.sample_id "
+              "JOIN work_paths p ON p.work_id = s.work_id WHERE p.path = $1 "
+              "AND ss.model_version_id = $2")
+    three = str(root / "three")
+    assert (await run(conn, pid, "t11", paths=[three]))[0] == "done"
+    assert prepared == {"fake2": 2}, prepared
+    assert await count(conn, scored, three, versions["fake2"]) == 2
+    await conn.execute(
+        "DELETE FROM sample_scores WHERE model_version_id = $1 AND sample_id = "
+        "(SELECT MIN(s.id) FROM work_samples s JOIN work_paths p "
+        " ON p.work_id = s.work_id WHERE p.path = $2)", versions["fake2"], three)
+    assert (await run(conn, pid, "t12", paths=[three]))[0] == "done"
+    assert prepared == {"fake2": 2}, prepared
+    assert await count(conn, scored, three, versions["fake2"]) == 2
+    assert (await run(conn, pid, "t13", paths=[three]))[0] == "done"
+    assert prepared == {}, prepared
+    print("  ok  the next scan scores again a model that failed, wholly or on some samples")
     await conn.execute("DELETE FROM model_profile_members WHERE profile_id = $1", pid)
 
 

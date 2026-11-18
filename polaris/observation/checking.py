@@ -134,9 +134,10 @@ def job_body(pipeline_factory: "scanning.PipelineFactory",
             pending, n_samples=None, show_progress=False,
             require_collection=False)
 
-        for target, obs in zip(pending, observed):
+        for target in pending:
             if stop:
                 return
+            obs = await worker.offload(conn, job["id"], next, observed)
             vec = obs.embeddings.get(version["backend"])
             if obs.error:
                 await _record(conn, job["id"], target, "error",

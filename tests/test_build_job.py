@@ -65,7 +65,7 @@ async def build(text: str) -> tuple[int, str, dict]:
         assert job["id"] == b["job_id"], (job["id"], b)
         outcome = await worker.run_job(conn, job, building.job_body(lambda: None))
         row = dict(await conn.fetchrow(
-            "SELECT v.state, v.drift, v.embedding_dim, v.error, j.error AS job_error, "
+            "SELECT v.state, v.drift, v.embedding_dim, v.error, j.error AS job_error, j.done, j.total, "
             "(SELECT count(*) FROM derived.tag_thresholds t "
             " WHERE t.model_version_id = v.id) AS thresholds "
             "FROM model_versions v, scan_jobs j WHERE v.id = $1 AND j.id = $2",
@@ -124,13 +124,15 @@ async def main() -> None:
             good = model(tmp / "good", tags=5)
             vid, outcome, row = await build(good)
             assert outcome == "done" and (row["state"], row["drift"], row["error"],
-                row["embedding_dim"], row["thresholds"]) == ("ready", None, None, 3, 5), row
+                row["embedding_dim"], row["thresholds"], row["done"], row["total"]) == (
+                "ready", None, None, 3, 5, 4, 4), row
             print("  ok  with no readable pages the version is ready, unverified")
             await api.delete_model_version(vid)
             async with state.store.acquire() as conn:
                 await pages(conn, tmp / "lib" / "work", building.PROBE_PAGES)
             _, outcome, row = await build(good)
             assert outcome == "done" and row["state"] == "ready" and row["drift"] == 0.0, row
+            assert (row["done"], row["total"]) == (4, 4), row
             print("  ok  recorded pages verify an FP32 build; missing files skipped")
             check_flips(sorted((tmp / "lib" / "work").glob("*.png")))
             async with state.store.acquire() as conn:

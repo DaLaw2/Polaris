@@ -154,7 +154,7 @@ async function picked(paths) {
 
 function queued(text, action) {
   poll.refresh()
-  const live = poll.worker?.workers.some(w => !w.stale)
+  const live = poll.worker?.workers.length
   if (!action && !live) action = { label: '啟動', run: () => emit('start') }
   toast.show(text, { tone: 'ok', action, timeout: 8000 })
 }

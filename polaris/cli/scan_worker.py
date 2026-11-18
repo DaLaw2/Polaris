@@ -7,7 +7,8 @@ running it inside the API server means hours with no heartbeat.
 Here the API can be restarted, or crash, and the scan keeps going; the
 only thing between them is a table.
 
-One worker, one job at a time, because there is one GPU.
+One worker, one job at a time, because there is one GPU. Being the one
+is holding an advisory lock; a second process finds it held and leaves.
 
     python -m polaris.cli.scan_worker           # keep taking jobs
     python -m polaris.cli.scan_worker --once    # take at most one, then stop
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import sys
 import time
 
@@ -30,6 +32,8 @@ from polaris.shared import tuning
 from polaris.shared.db import Store
 
 POLL = 5.0
+
+log = logging.getLogger(__name__)
 
 
 async def idle_release(conn) -> float:
@@ -41,6 +45,9 @@ async def idle_release(conn) -> float:
 async def main(args) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    logging.basicConfig(
+        level=logging.INFO, stream=sys.stdout,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     from polaris.models import tagger
     from polaris.observation.pipeline import Pipeline
@@ -49,20 +56,19 @@ async def main(args) -> int:
     await store.connect()
     who = worker.worker_id()
 
+    lock = await worker.hold(store.dsn, who)
     async with store.acquire() as conn:
-        live = [w for w in await worker.roster(conn) if not w["stale"]]
-        if live and not args.force:
-            for w in live:
+        if lock is None:
+            for w in await worker.roster(conn):
                 doing = (f"job {w['job_id']}" if w["job_id"]
                          else "waiting for one")
-                print(f"{w['id']} is already here ({doing}). "
-                      f"--force to start anyway.", flush=True)
+                log.info("%s is already here (%s).", w["id"], doing)
             return 0
         await worker.register(conn, who)
         idle_release_s = await idle_release(conn)
 
-    print(f"worker {who} waiting for jobs "
-          f"(models released after {idle_release_s:.0f}s idle)", flush=True)
+    log.info("worker %s waiting for jobs (models released after %.0fs idle)",
+             who, idle_release_s)
 
     made: dict[tuple, object] = {}
 
@@ -79,10 +85,9 @@ async def main(args) -> int:
                                  raw_top_k=top_k or tagger.RAW_TOP_K)
         return made[key]
 
-    note = lambda m: print(m, flush=True)  # noqa: E731
-    bodies = {"scan": scanning.job_body(factory, on_note=note),
-              "check": checking.job_body(factory, on_note=note),
-              "build": building.job_body(release_pipelines, on_note=note)}
+    bodies = {"scan": scanning.job_body(factory, on_note=log.info),
+              "check": checking.job_body(factory, on_note=log.info),
+              "build": building.job_body(release_pipelines, on_note=log.info)}
 
     idle_since = time.monotonic()
     try:
@@ -90,26 +95,26 @@ async def main(args) -> int:
             async with store.acquire() as conn:
                 job = await worker.claim(conn, who)
             if job is not None:
-                print(f"\n{job['kind']} job {job['id']}: "
-                      f"collection={job['collection']!r} "
-                      f"path={job['path']!r}", flush=True)
+                log.info("%s job %s: collection=%r path=%r", job["kind"],
+                         job["id"], job["collection"], job["path"])
                 async with store.acquire() as conn:
                     await worker.seen(conn, who, models_loaded=bool(made))
                     state = await worker.run_job(
                         conn, job, bodies[job["kind"]])
-                print(f"job {job['id']} {state}", flush=True)
+                log.info("job %s %s", job["id"], state)
                 idle_since = time.monotonic()
                 if args.once:
                     return 0
                 continue
 
             if args.once:
-                print("nothing queued", flush=True)
+                log.info("nothing queued")
                 return 0
 
+            await lock.execute("SELECT 1")
             async with store.acquire() as conn:
                 if await worker.seen(conn, who, models_loaded=bool(made)):
-                    print("stop requested; leaving", flush=True)
+                    log.info("stop requested; leaving")
                     return 0
                 idle_release_s = await idle_release(conn)
 
@@ -117,18 +122,17 @@ async def main(args) -> int:
                 release_pipelines()
                 async with store.acquire() as conn:
                     await worker.seen(conn, who, models_loaded=False)
-                print(f"idle {idle_release_s:.0f}s; released the models",
-                      flush=True)
+                log.info("idle %.0fs; released the models", idle_release_s)
 
             await asyncio.sleep(POLL)
     except KeyboardInterrupt:
-        print("stopping; the job keeps its lease until it expires",
-              flush=True)
+        log.info("stopping; the job keeps its lease until it expires")
         return 130
     finally:
         release_pipelines()
         async with store.acquire() as conn:
             await worker.retire(conn, who)
+        await lock.close()
         await store.close()
 
 
@@ -136,8 +140,6 @@ def run() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--once", action="store_true",
                     help="take at most one job, then exit")
-    ap.add_argument("--force", action="store_true",
-                    help="start even though another worker is live")
     return asyncio.run(main(ap.parse_args()))
 
 

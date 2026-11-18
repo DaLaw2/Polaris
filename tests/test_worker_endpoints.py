@@ -1,5 +1,7 @@
 """A started worker outlives its request: POLARIS_TEST_DSN=postgresql://.../polaris_test python tests/test_worker_endpoints.py"""
 import asyncio
+import os
+import signal
 import tempfile
 import time
 from pathlib import Path
@@ -33,30 +35,36 @@ async def main(tmp: Path) -> None:
             await conn.execute("DELETE FROM scan_workers")
         out = await jobs_api.scan_worker_status()
         assert out["workers"] == [] and out["lease_s"] == worker.LEASE_S
-        assert (await jobs_api.stop_scan_worker(id=None, forget=False))["asked"] == 0
+        assert (await jobs_api.stop_scan_worker(id=None))["asked"] == 0
         card = await jobs_api.gpu()
         assert not card["present"] or card["used_mb"] <= card["total_mb"], card
         print("  ok  no worker is an empty list, stopping nobody asks nobody, the card answers")
 
-        started = (await jobs_api.start_scan_worker(force=False))["worker"]["id"]
-        assert started.rsplit(":", 1)[1].isdigit(), started
+        one = (await jobs_api.start_scan_worker())["worker"]
+        started = one["id"]
+        assert started.endswith(f":{one['pid']}"), one
         seen = await jobs_api.scan_worker_status()
         assert [(w["id"], w["job_id"]) for w in seen["workers"]] == [(started, None)]
-        why = await refused(jobs_api.start_scan_worker(force=False), 409, "worker_running")
+        why = await refused(jobs_api.start_scan_worker(), 409, "worker_running")
         assert started in why["message"]
+        await asyncio.sleep(3)
         tail = await jobs_api.scan_worker_log(lines=50)
         assert tail["path"] == str(jobs_api.WORKER_LOG)
         assert any(started in line for line in tail["lines"]), tail["lines"][-5:]
         print(f"  ok  {started} starts, holds no job, refuses a second, and its log is readable")
 
+        os.kill(one["pid"], signal.SIGTERM)
+        assert await gone(5.0), "a killed worker is still on the roster"
+        started = (await jobs_api.start_scan_worker())["worker"]["id"]
+        print("  ok  a killed worker leaves the roster at once, and another can start")
+
         await asyncio.sleep(12)
         again = (await jobs_api.scan_worker_status())["workers"]
-        assert again and again[0]["heartbeat_at"] > seen["workers"][0]["heartbeat_at"]
-        assert again[0]["stale"] is False
-        print("  ok  it outlives the request that started it, and keeps beating")
+        assert [w["id"] for w in again] == [started]
+        print("  ok  it outlives the request that started it")
 
-        assert (await jobs_api.stop_scan_worker(id=started, forget=False))["asked"] == 1
-        assert (await jobs_api.stop_scan_worker(id=started, forget=False))["asked"] == 0
+        assert (await jobs_api.stop_scan_worker(id=started))["asked"] == 1
+        assert (await jobs_api.stop_scan_worker(id=started))["asked"] == 0
         assert await gone(), "the worker ignored a stop request"
         started = None
         print("  ok  it hears the stop, leaves, and takes its row with it")

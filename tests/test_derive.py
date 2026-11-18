@@ -220,10 +220,10 @@ async def main():
             await tr.rollback()
             assert await profiles.active_profile(conn) is not None
             print("  ok  with no active profile the views refuse instead of guessing")
-
-            await clean(conn)
         print("all derive checks passed")
     finally:
+        async with state.store.acquire() as conn:
+            await clean(conn)
         await state.store.close()
 
 

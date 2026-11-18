@@ -25,13 +25,11 @@ onMounted(async () => {
 
 const scanner = computed(() => scannerState(poll))
 const workers = computed(() => poll.worker?.workers || [])
-const live = computed(() => workers.value.filter(w => !w.stale))
-const stale = computed(() => workers.value.filter(w => w.stale))
 const scanJobs = computed(() => {
   const k = poll.worker?.by_kind || {}
   return ['scan', 'check', 'build'].reduce((s, x) => s + (k[x]?.queued || 0), 0)
 })
-const busyWith = computed(() => live.value.find(w => w.job_id)?.job_id)
+const busyWith = computed(() => workers.value.find(w => w.job_id)?.job_id)
 
 const derive = computed(() => poll.worker?.by_kind?.derive || { queued: 0, running: 0 })
 const deriving = computed(() =>
@@ -41,17 +39,16 @@ const gpu = computed(() => poll.gpu)
 const gpuPct = computed(() => (gpu.value?.present ? pct(gpu.value.used_mb, gpu.value.total_mb) : 0))
 
 const busy = ref(false)
-async function worker(method, query = '') {
+async function worker(method) {
   busy.value = true
   try {
-    await api(`/api/scan/worker${query}`, { method })
+    await api('/api/scan/worker', { method })
     await poll.refresh()
   } catch (e) { toast.bad(e) }
   busy.value = false
 }
 const start = () => worker('POST')
 const stop = () => worker('DELETE')
-const forget = () => worker('DELETE', '?forget=true')
 </script>
 
 <template>
@@ -60,15 +57,13 @@ const forget = () => worker('DELETE', '?forget=true')
       <dt>掃描程序</dt>
       <dd class="scan-state"><i :class="['dot', scanner.tone]"></i>{{ scanner.text }}</dd>
       <div class="sub">
+        <template v-if="workers.length">PID {{ workers[0].pid }} · </template>
         <template v-if="busyWith">工作 #{{ busyWith }} · </template>排隊中 {{ n(scanJobs) }}
       </div>
       <div class="scan-acts">
-        <button v-if="!live.length" class="btn sm" :disabled="busy || !poll.reachable" @click="start">啟動</button>
-        <button v-else class="btn sm warn" :disabled="busy || live.every(w => w.stop_requested)"
+        <button v-if="!workers.length" class="btn sm" :disabled="busy || !poll.reachable" @click="start">啟動</button>
+        <button v-else class="btn sm warn" :disabled="busy || workers.every(w => w.stop_requested)"
                 title="完成目前的作品後停止" @click="stop">停止</button>
-        <button v-if="stale.length" class="btn quiet sm" :disabled="busy" @click="forget">
-          清除無回應 {{ stale.length }}
-        </button>
       </div>
     </div>
 
